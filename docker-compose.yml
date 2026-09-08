@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ai-agent-postgres
+    environment:
+      POSTGRES_USER: ai_agent
+      POSTGRES_PASSWORD: ai_agent123
+      POSTGRES_DB: ai_agent
+    ports:
+      - "5433:5432"
+
+  redis:
+    image: redis:7
+    container_name: ai-agent-redis
+    ports:
+      - "6380:6379"
