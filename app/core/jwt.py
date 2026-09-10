@@ -5,6 +5,7 @@
         Signature 服务器利用SECRET_KEY对Header + Payload进行签名
 """
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import jwt
 from jwt.exceptions import InvalidTokenError
@@ -16,6 +17,7 @@ def create_access_token(user_id: int) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_access_token_expire_minutes)
     payload = {
         'sub': str(user_id),
+        'jti': str(uuid4()),  # 唯一标识一个token
         'exp': expire
     }
     return jwt.encode(
