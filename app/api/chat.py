@@ -21,7 +21,8 @@ async def chat_completion(
 ):
     answer = await chat(
         message=chat_data.message,
-        user_id=current_user.id
+        user_id=current_user.id,
+        conversation_id=chat_data.conversation_id
     )
 
     return ChatResponse(
