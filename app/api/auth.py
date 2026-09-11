@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import get_db
+from app.api.dependencies import get_db, get_redis, oauth2_scheme
 from app.schemas.auth import TokenResponse
-from app.services.auth import login
+from app.services.auth import login, logout
 
 router = APIRouter(
     prefix='/auth',
@@ -33,3 +34,21 @@ async def login_user(
     return TokenResponse(
         access_token=access_token
     )
+
+
+@router.post('/logout')
+async def logout_user(
+        token: str = Depends(oauth2_scheme),
+        redis: Redis = Depends(get_redis)
+):
+    try:
+        await logout(token, redis)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Could not validate credentials',
+            headers={'WWW-Authenticate': 'Bearer'}
+        )
+    return {
+        'message': 'Logged out successfully'
+    }
