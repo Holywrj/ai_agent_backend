@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int = 30
 
     deepseek_api_key: str
+    dashscope_api_key: str
 
     model_config = SettingsConfigDict(
         env_file='.env',
