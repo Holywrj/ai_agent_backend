@@ -9,6 +9,7 @@ from app.models.conversation import Conversation
 from app.services.context import select_messages_by_token_budget
 from app.services.memory import create_conversation, get_messages, save_langchain_message
 from app.services.summary import update_summary
+from app.services.token_counter import estimate_messages_tokens
 from app.tools.registry import get_all_tools
 
 HISTORY_MESSAGE_LIMIT = 50
@@ -58,24 +59,14 @@ async def chat(
     history = select_messages_by_token_budget(
         messages=history,
         token_budget=HISTORY_TOKEN_BUDGET,
-        token_counter=llm.get_num_tokens_from_messages
+        token_counter=estimate_messages_tokens
     )
-    history_count = len(history)
-    # 7. 历史消息已经是 LangChain Message
+    # 7. 创建当前用户消息
+    current_user_message = HumanMessage(
+        content=message
+    )
+    # 8. 构造 Agent Context
     messages = history.copy()
-    # 8. 加入当前用户消息
-    messages.append(
-        HumanMessage(
-            content=message
-        )
-    )
-    # 9. 创建 System Prompt
-    system_prompt = (
-        '你是一个专业的 AI 助手。'
-        '回答用户问题时要准确、简洁。'
-        '如果需要查询实时天气，可以使用天气工具。'
-    )
-    # 10. 如果存在Summary，把它作为额外上下文
     if conversation.summary:
         messages.insert(
             0,
@@ -89,30 +80,38 @@ async def chat(
                 )
             )
         )
-    # 11. 创建LangChain Agent
+    messages.append(current_user_message)
+    # 9. 创建LangChain Agent
+    system_prompt = (
+        '你是一个专业的 AI 助手。'
+        '回答用户问题时要准确、简洁。'
+        '如果需要查询实时天气，可以使用天气工具。'
+    )
     agent = create_agent(
         model=llm,
         tools=get_all_tools(),
         system_prompt=system_prompt
     )
-    # 12. 调用 Agent
+    # 10. 调用 Agent
     result = await agent.ainvoke({
         'messages': messages
     })
-    answer = result['messages'][-1].content
-    # 13. 只保存本次请求产生的新消息
-    new_messages = result['messages'][history_count + 1:]
+    result_messages = result['messages']
+    # 11. 找到当前User Message在Agent返回结果中的位置
+    current_user_index = next(
+        index
+        for index, msg in enumerate(result_messages)
+        if msg is current_user_message
+    )
+    # 12. 只保存当前User Message后面的Agent消息
+    new_messages = result_messages[current_user_index:]
     for msg in new_messages:
         await save_langchain_message(
             db=db,
             conversation_id=conversation.id,
             message=msg
         )
-    # 14. 当前用户消息单独保存
-    await save_langchain_message(
-        db=db,
-        conversation_id=conversation.id,
-        message=HumanMessage(content=message)
-    )
+    # 13. 最后一条消息就是回答
+    answer = result_messages[-1].content
 
     return conversation.id, answer
