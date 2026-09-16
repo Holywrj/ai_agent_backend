@@ -5,7 +5,7 @@ from app.core.config import settings
 
 def create_llm() -> ChatOpenAI:
     return ChatOpenAI(
-        model='deepseek-v4-pro',
+        model=settings.deepseek_chat_model,
         api_key=settings.deepseek_api_key,
-        base_url='https://api.deepseek.com'
+        base_url=settings.deepseek_base_url
     )
