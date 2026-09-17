@@ -142,14 +142,21 @@ async def ingest_document(
 async def get_document(
         db: AsyncSession,
         document_id: int
-) -> KnowledgeDocument | None:
+) -> KnowledgeDocument:
     result = await db.execute(
         select(KnowledgeDocument).where(
             KnowledgeDocument.id == document_id
         )
     )
 
-    return result.scalar_one_or_none()
+    document = result.scalar_one_or_none()
+    if document is None:
+        raise BusinessException(
+            message='knowledge Document not found',
+            code='KNOWLEDGE_DOCUMENT_NOT_FOUND'
+        )
+
+    return document
 
 
 async def delete_document(

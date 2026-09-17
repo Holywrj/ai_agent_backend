@@ -100,10 +100,13 @@ async def chat(
         '你是一个专业的 AI 助手。'
         '回答用户问题时要准确、简洁。'
         '如果需要查询实时天气，可以使用天气工具。'
+        '如果用户的问题涉及内部知识、业务规则、'
+        '产品文档或知识库内容，可以优先使用知识库搜索工具。'
+        '用户不满意回答，再扩展搜索资料补充。'
     )
     agent = create_agent(
         model=create_llm(),
-        tools=get_all_tools(),
+        tools=get_all_tools(db=db),
         system_prompt=system_prompt
     )
     # 10. 调用 Agent
