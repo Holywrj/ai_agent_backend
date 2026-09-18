@@ -1,18 +1,17 @@
-from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.llm import create_llm
+from app.core.checkpointer import checkpointer
 from app.exceptions.base import BusinessException
+from app.graph.agent import create_agent_graph
 from app.models.conversation import Conversation
 from app.services.context import select_messages_by_token_budget
 from app.services.memory import create_conversation, get_messages, save_langchain_message
 from app.services.redis_memory import get_recent_messages, rebuild_memory, save_messages
 from app.services.summary import update_summary
 from app.services.token_counter import estimate_messages_tokens
-from app.tools.registry import get_all_tools
 
 HISTORY_MESSAGE_LIMIT = 50
 HISTORY_TOKEN_BUDGET = 6000
@@ -79,49 +78,49 @@ async def chat(
     current_user_message = HumanMessage(
         content=message
     )
-    # 8. 构造 Agent Context
-    messages = history.copy()
-    if conversation.summary:
-        messages.insert(
-            0,
-            SystemMessage(
-                content=(
-                    '以下是当前会话较早历史的摘要。'
-                    '它用于帮助你理解长期上下文。'
-                    '如果摘要与最近的原始消息存在冲突，'
-                    '优先相信最近的原始消息。\n\n'
-                    f'会话摘要：\n{conversation.summary}'
-                )
-            )
-        )
-    messages.append(current_user_message)
-    # 9. 创建LangChain Agent
-    system_prompt = (
-        '你是一个专业的 AI 助手。'
-        '回答用户问题时要准确、简洁。'
-        '如果需要查询实时天气，可以使用天气工具。'
-        '如果用户的问题涉及内部知识、业务规则、'
-        '产品文档或知识库内容，可以优先使用知识库搜索工具。'
-        '用户不满意回答，再扩展搜索资料补充。'
+    # 8. 创建LangGraph
+    graph = create_agent_graph(db=db)
+    # 9. conversation_id -> LangGraph thread_id
+    # 当前业务层已经保证Conversation属于当前user，
+    # 因此conversation_id可以作为Graph状态轨迹的唯一业务标识。
+    thread_id = f'conversation:{conversation.id}'
+    config = {
+        'configurable': {
+            'thread_id': thread_id
+        }
+    }
+    # 10. 查询这个thread是否已经存在checkpoint
+    checkpoint = await graph.aget_state(
+        config
     )
-    agent = create_agent(
-        model=create_llm(),
-        tools=get_all_tools(db=db),
-        system_prompt=system_prompt
+    checkpoint_messages = checkpoint.values.get('messages', [])
+    has_checkpoint = bool(checkpoint_messages)
+    if has_checkpoint:
+        # 已经存在checkpoint
+        # graph会恢复以前的agent state，因此这里只传本次新增的HumanMessage
+        initial_message_count = len(checkpoint_messages)
+        graph_input = {
+            'messages': [current_user_message],
+            'context_messages': history,
+            'summary': conversation.summary,
+        }
+    else:
+        # 第一次使用这个thread
+        # checkpointer没有以前的state，所以用业务Memory给graph初始话工作状态
+        initial_message_count = len(history)
+        graph_input = {
+            'messages': [*history, current_user_message],
+            'context_messages': history,
+            'summary': conversation.summary,
+        }
+    # 11. 调用 LangGraph
+    result = await graph.ainvoke(
+        graph_input,
+        config
     )
-    # 10. 调用 Agent
-    result = await agent.ainvoke({
-        'messages': messages
-    })
     result_messages = result['messages']
-    # 11. 找到当前User Message在Agent返回结果中的位置
-    current_user_index = next(
-        index
-        for index, msg in enumerate(result_messages)
-        if msg is current_user_message
-    )
-    # 12. 只保存当前User Message后面的Agent消息
-    new_messages = result_messages[current_user_index:]
+    # 12. 只保存本次调用新产生的消息
+    new_messages = result_messages[initial_message_count:]
     for msg in new_messages:
         await save_langchain_message(
             db=db,
