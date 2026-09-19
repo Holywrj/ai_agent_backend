@@ -1,9 +1,12 @@
+from dataclasses import dataclass
+from typing import Any, Literal
+
 from langchain_core.messages import HumanMessage
+from langgraph.types import Command
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.checkpointer import checkpointer
 from app.exceptions.base import BusinessException
 from app.graph.agent import create_agent_graph
 from app.models.conversation import Conversation
@@ -17,44 +20,65 @@ HISTORY_MESSAGE_LIMIT = 50
 HISTORY_TOKEN_BUDGET = 6000
 
 
+@dataclass(slots=True)
+class ChatResult:
+    conversation_id: int
+    answer: str
+    status: Literal['completed', 'waiting_approval']
+    interrupt_id: str | None = None
+    interrupt_value: dict[str, Any] | None = None
+
+
+async def _get_conversation(
+        db: AsyncSession,
+        conversation_id: int,
+        user_id: int
+) -> Conversation:
+    result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.user_id == user_id
+        )
+    )
+    conversation = result.scalar_one_or_none()
+    if conversation is None:
+        raise BusinessException(
+            message='Conversation not found',
+            code='CONVERSATION_NOT_FOUND'
+        )
+    return conversation
+
+
 async def chat(
         db: AsyncSession,
         redis: Redis,
         message: str,
         user_id: int,
         conversation_id: int | None
-) -> tuple[int, str]:
-    # 1. 没有 conversation_id, 创建新的 Conversation
+) -> ChatResult:
+    # 1. 获取/创建 Conversation
     if conversation_id is None:
         conversation = await create_conversation(
             db=db,
             user_id=user_id
         )
     else:
-        # 2. 有 conversation_id, 确认这个 Conversation 属于当前用户
-        result = await db.execute(
-            select(Conversation).where(
-                Conversation.id == conversation_id,
-                Conversation.user_id == user_id
-            )
+        conversation = await _get_conversation(
+            db=db,
+            conversation_id=conversation_id,
+            user_id=user_id
         )
-        conversation = result.scalar_one_or_none()
-        if conversation is None:
-            raise BusinessException(
-                message='Conversation not found',
-                code='CONVERSATION_NOT_FOUND'
-            )
-    # 3. 如果历史消息达到条件，先更新Summary
+    # 2. 如果历史消息达到条件，先更新Summary
     await update_summary(
         db=db,
         conversation=conversation
     )
-    # 4. 优先从Redis获取短期Memory
+    # 3. 优先从Redis获取短期Memory
     history = await get_recent_messages(
         redis=redis,
         conversation_id=conversation.id
     )
-    # 5. Redis未命中，从PostgreSQL恢复
+    # 4. Redis未命中，从PostgreSQL恢复
     if not history:
         history = await get_messages(
             db=db,
@@ -68,36 +92,38 @@ async def chat(
             conversation_id=conversation.id,
             messages=history
         )
-    # 6. 根据 Token Budget 筛选历史
+    # 5. 根据 Token Budget 筛选历史
     history = select_messages_by_token_budget(
         messages=history,
         token_budget=HISTORY_TOKEN_BUDGET,
         token_counter=estimate_messages_tokens
     )
-    # 7. 创建当前用户消息
+    # 6. 创建当前用户消息
     current_user_message = HumanMessage(
         content=message
     )
-    # 8. 创建LangGraph
+    # 7. 创建LangGraph
     graph = create_agent_graph(db=db)
-    # 9. conversation_id -> LangGraph thread_id
-    # 当前业务层已经保证Conversation属于当前user，
-    # 因此conversation_id可以作为Graph状态轨迹的唯一业务标识。
     thread_id = f'conversation:{conversation.id}'
     config = {
         'configurable': {
             'thread_id': thread_id
         }
     }
-    # 10. 查询这个thread是否已经存在checkpoint
+    # 8. 检查当前Graph State
     checkpoint = await graph.aget_state(
         config
     )
+    # 如果之前已经暂停等待审批，不允许用户绕过审批继续提交新的消息。
+    if checkpoint.interrupts:
+        raise BusinessException(
+            message='Conversation has a pending approval',
+            code='APPROVAL_PENDING'
+        )
     checkpoint_messages = checkpoint.values.get('messages', [])
     has_checkpoint = bool(checkpoint_messages)
+    # 9. 确定本次Graph执行开始之前已有多少消息
     if has_checkpoint:
-        # 已经存在checkpoint
-        # graph会恢复以前的agent state，因此这里只传本次新增的HumanMessage
         initial_message_count = len(checkpoint_messages)
         graph_input = {
             'messages': [current_user_message],
@@ -105,39 +131,48 @@ async def chat(
             'summary': conversation.summary,
         }
     else:
-        # 第一次使用这个thread
-        # checkpointer没有以前的state，所以用业务Memory给graph初始话工作状态
         initial_message_count = len(history)
         graph_input = {
             'messages': [*history, current_user_message],
             'context_messages': history,
             'summary': conversation.summary,
         }
-    # 11. 调用 LangGraph
+    # 10. 执行Graph
     result = await graph.ainvoke(
         graph_input,
         config
     )
-    print("\n========== Graph State History ==========")
-    history_index = 0
-    async for snapshot in graph.aget_state_history(config, limit=10):
-        messages = snapshot.values.get(
-            "messages",
-            []
-        )
-        print(f"Checkpoint #{history_index}")
-        print(f"created_at: {snapshot.created_at}")
-        print(f"next: {snapshot.next}")
-        print(f"messages: {len(messages)}")
-        if messages:
-            print(
-                f"last_message: "
-                f"{type(messages[-1]).__name__}"
+    # 11. 检查是否被interrupt
+    interrupts = result.get('__interrupt__', ())
+    if interrupts:
+        interrupt_info = interrupts[0]
+        # 通过Checkpoint读取中断时真正保存下来的State
+        interrupted_state = await graph.aget_state(config)
+        interrupted_messages = interrupted_state.values.get('messages', [])
+        # 保存本次已经产生的业务信息 Human + AI（tool_call）
+        new_messages = interrupted_messages[initial_message_count:]
+        for msg in new_messages:
+            await save_langchain_message(
+                db=db,
+                conversation_id=conversation.id,
+                message=msg
             )
-        history_index += 1
-    print("==========================================\n")
+        await save_messages(
+            redis=redis,
+            conversation_id=conversation.id,
+            messages=new_messages
+        )
+
+        return ChatResult(
+            conversation_id=conversation.id,
+            answer='等待人工确认。',
+            status='waiting_approval',
+            interrupt_id=interrupt_info.id,
+            interrupt_value=interrupt_info.value
+        )
+
+    # 12. Graph正常结束
     result_messages = result['messages']
-    # 12. 只保存本次调用新产生的消息
     new_messages = result_messages[initial_message_count:]
     for msg in new_messages:
         await save_langchain_message(
@@ -145,13 +180,98 @@ async def chat(
             conversation_id=conversation.id,
             message=msg
         )
-    # 13. Redis更新Short-term Memory
     await save_messages(
         redis=redis,
         conversation_id=conversation.id,
         messages=new_messages
     )
-    # 14. 最后一条消息就是回答
-    answer = result_messages[-1].content
 
-    return conversation.id, answer
+    return ChatResult(
+        conversation_id=conversation.id,
+        answer=result_messages[-1].content,
+        status='completed'
+    )
+
+
+async def resume_chat(
+        db: AsyncSession,
+        redis: Redis,
+        conversation_id: int,
+        user_id: int,
+        interrupt_id: str,
+        approved: bool
+) -> ChatResult:
+    # 1. 校验Conversation所属用户
+    conversation = await _get_conversation(
+        db=db,
+        conversation_id=conversation_id,
+        user_id=user_id
+    )
+    # 2. 创建Graph
+    graph = create_agent_graph(db=db)
+    thread_id = f'conversation:{conversation.id}'
+    config = {
+        'configurable': {
+            'thread_id': thread_id
+        }
+    }
+    # 3. 获取当前Checkpoint
+    checkpoint = await graph.aget_state(config)
+    if not checkpoint.interrupts:
+        raise BusinessException(
+            message='No pending approval',
+            code='NO_PENDING_APPROVAL'
+        )
+    pending_interrupt = next(
+        (
+            item
+            for item in checkpoint.interrupts
+            if item.id == interrupt_id
+        ),
+        None
+    )
+    if pending_interrupt is None:
+        raise BusinessException(
+            message='Interrupt not found',
+            code='INTERRUPT_NOT_FOUND'
+        )
+    # 4. Resume
+    before_message_count = len(checkpoint.values.get('messages', []))
+    result = await graph.ainvoke(
+        Command[Any](
+            resume=approved
+        ),
+        config
+    )
+    # 5. 正常结束
+    interrupts = result.get('__interrupt__', ())
+    if interrupts:
+        interrupt_info = interrupts[0]
+
+        return ChatResult(
+            conversation_id=conversation.id,
+            answer='仍然等待人工确认',
+            status='waiting_approval',
+            interrupt_id=interrupt_info.id,
+            interrupt_value=interrupt_info.value
+        )
+
+    result_messages = result['messages']
+    new_messages = result_messages[before_message_count:]
+    for msg in new_messages:
+        await save_langchain_message(
+            db=db,
+            conversation_id=conversation.id,
+            message=msg
+        )
+    await save_messages(
+        redis=redis,
+        conversation_id=conversation.id,
+        messages=new_messages
+    )
+
+    return ChatResult(
+        conversation_id=conversation.id,
+        answer=result_messages[-1].content,
+        status='completed'
+    )

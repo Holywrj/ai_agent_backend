@@ -2,7 +2,7 @@ from langchain_core.tools import BaseTool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.tools.weather import get_weather
-from app.tools.knowledge import create_search_knowledge_tool
+from app.tools.knowledge import create_search_knowledge_tool, create_delete_knowledge_tool
 
 RAG_TOP_K = 5
 RAG_SCORE_THRESHOLD = None
@@ -17,5 +17,8 @@ def get_all_tools(
             db=db,
             top_k=RAG_TOP_K,
             score_threshold=RAG_SCORE_THRESHOLD
+        ),
+        create_delete_knowledge_tool(
+            db=db
         ),
     ]
