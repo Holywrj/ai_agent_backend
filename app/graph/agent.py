@@ -1,6 +1,8 @@
-from langchain_core.messages import SystemMessage, AnyMessage, HumanMessage
+from langchain_core.messages import SystemMessage, AnyMessage, HumanMessage, AIMessage
+from langgraph.errors import NodeError
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.types import RetryPolicy, default_retry_on
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.checkpointer import checkpointer
@@ -37,6 +39,48 @@ class AgentState(MessagesState):
     """
     context_messages: list[AnyMessage]
     summary: str | None
+
+
+# Agent Node的RetryPolicy
+# initial_interval: 第一次失败以后，等多少秒再进行第一次重试
+# backoff_factor: 指数退避（exponential backoff），每次重试之间的等待时间乘以多少
+# max_interval: 最大的等待时间。min(计算出来的 backoff, max_interval)
+# max_attempts: 总共最多执行次数，包含第一次
+# jitter: 是否给重试等待时间增加一点随机性。Thundering Herd（惊群），大量请求在同一时间再次打向已经有问题的服务
+# retry_on: default_retry_on，LangGraph 使用自己的默认“哪些异常适合 Retry”的判断
+AGENT_RETRY_POLICY = RetryPolicy(
+    initial_interval=0.5,
+    backoff_factor=2.0,
+    max_interval=4.0,
+    max_attempts=3,
+    jitter=False,
+    retry_on=default_retry_on
+)
+
+
+def handle_agent_error(
+        state: AgentState,
+        error: NodeError
+) -> dict:
+    """
+    Agent Node 多次尝试仍然失败后的最终错误处理。
+    """
+    print(
+        f'Agent Node 执行失败：'
+        f'node={error.node}, '
+        f'error={error.error}'
+    )
+
+    return {
+        'messages': [
+            AIMessage(
+                content=(
+                    '抱歉，模型服务当前暂时不可用，'
+                    '请稍后再试。'
+                )
+            )
+        ]
+    }
 
 
 def create_agent_graph(
@@ -93,9 +137,22 @@ def create_agent_graph(
     # 4. 创建Graph Builder
     builder = StateGraph(AgentState)
     # 5. 注册Agent Node
-    builder.add_node('agent', call_model)
+    builder.add_node(
+        'agent',
+        call_model,
+        retry_policy=AGENT_RETRY_POLICY,
+        error_handler=handle_agent_error
+    )
     # 6. 注册ToolNode
-    builder.add_node('tools', ToolNode(tools))
+    # handle_tool_errors=True,
+    # Tool 执行出现异常时，不让整个 Graph 直接炸掉，而是把异常转换成 ToolMessage，让 Agent 看见这个工具执行失败。
+    builder.add_node(
+        'tools',
+        ToolNode(
+            tools,
+            handle_tool_errors=True
+        )
+    )
     # 7. Graph开始 -> Agent
     builder.add_edge(START, 'agent')
     # 8. Agent -> 根据Tool Calling结果决定下一步
