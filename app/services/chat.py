@@ -118,6 +118,24 @@ async def chat(
         graph_input,
         config
     )
+    print("\n========== Graph State History ==========")
+    history_index = 0
+    async for snapshot in graph.aget_state_history(config, limit=10):
+        messages = snapshot.values.get(
+            "messages",
+            []
+        )
+        print(f"Checkpoint #{history_index}")
+        print(f"created_at: {snapshot.created_at}")
+        print(f"next: {snapshot.next}")
+        print(f"messages: {len(messages)}")
+        if messages:
+            print(
+                f"last_message: "
+                f"{type(messages[-1]).__name__}"
+            )
+        history_index += 1
+    print("==========================================\n")
     result_messages = result['messages']
     # 12. 只保存本次调用新产生的消息
     new_messages = result_messages[initial_message_count:]
