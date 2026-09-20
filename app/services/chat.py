@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 from typing import Any, Literal
+import json
+from collections.abc import AsyncIterator
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessageChunk
 from langgraph.types import Command
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -274,4 +276,199 @@ async def resume_chat(
         conversation_id=conversation.id,
         answer=result_messages[-1].content,
         status='completed'
+    )
+
+
+async def stream_chat(
+        db: AsyncSession,
+        redis: Redis,
+        message: str,
+        user_id: int,
+        conversation_id: int | None
+) -> AsyncIterator[str]:
+    # 1 获取/创建Conversation
+    if conversation_id is None:
+        conversation = await create_conversation(
+            db=db,
+            user_id=user_id
+        )
+    else:
+        conversation = await _get_conversation(
+            db=db,
+            conversation_id=conversation_id,
+            user_id=user_id
+        )
+    # 2. 更新Summary
+    await update_summary(
+        db=db,
+        conversation=conversation
+    )
+    # 3. Redis获取短期Memory
+    history = await get_recent_messages(
+        redis=redis,
+        conversation_id=conversation.id
+    )
+    # 4. Redis MISS -> PostgreSQL
+    if not history:
+        history = await get_messages(
+            db=db,
+            conversation_id=conversation.id,
+            limit=HISTORY_MESSAGE_LIMIT
+        )
+        await rebuild_memory(
+            redis=redis,
+            conversation_id=conversation.id,
+            messages=history
+        )
+    # 5. Token Budget
+    history = select_messages_by_token_budget(
+        messages=history,
+        token_budget=HISTORY_TOKEN_BUDGET,
+        token_counter=estimate_messages_tokens
+    )
+    # 6. 当前User Message
+    current_user_message = HumanMessage(
+        content=message
+    )
+    # 7. 创建Graph
+    graph = create_agent_graph(db=db)
+    thread_id = f'conversation:{conversation.id}'
+    config = {
+        'configurable': {
+            'thread_id': thread_id
+        }
+    }
+    # 8. 检查当前Graph State
+    checkpoint = await graph.aget_state(config)
+    if checkpoint.interrupts:
+        yield (
+            'event: error\n'
+            'data: '
+            + json.dumps(
+                {
+                    'code': 'APPROVAL_PENDING',
+                    'message': 'Conversation has a pending approval'
+                },
+                ensure_ascii=False
+            )
+            + '\n\n'
+        )
+        return
+    checkpoint_messages = checkpoint.values.get('messages', [])
+    has_checkpoint = bool(checkpoint_messages)
+    # 9. 准备本次Graph输入
+    if has_checkpoint:
+        initial_message_count = len(checkpoint_messages)
+        graph_input = {
+            'messages': [current_user_message],
+            'context_messages': history,
+            'summary': conversation.summary
+        }
+    else:
+        initial_message_count = len(history)
+        graph_input = {
+            'messages': [*history, current_user_message],
+            'context_messages': history,
+            'summary': conversation.summary
+        }
+
+    # 10. SSE 辅助函数
+    def make_event(event: str, data: dict) -> str:
+        return (
+            f'event: {event}\n'
+            f'data: {json.dumps(data, ensure_ascii=False)}\n\n'
+        )
+
+    # 11. Graph Streaming
+    # astream()支持多个stream_mode同时使用
+    # messages：LLM token流
+    # updates：节点更新流
+    # version：LangGraph Streaming 返回的数据结构采用哪一代 Stream Protocol
+    #   v2 会把不同的流结果统一成带类型的信息结构
+    async for part in graph.astream(
+        graph_input,
+        config,
+        stream_mode=['messages', 'updates'],
+        version='v2'
+    ):
+        # todo: messages: LLM Token Streaming
+        if part['type'] == 'messages':
+            message_chunk, metadata = part['data']
+            if isinstance(message_chunk, AIMessageChunk):
+                if isinstance(message_chunk.content, str) and message_chunk.content:
+                    yield make_event(
+                        'token',
+                        {
+                            'content': message_chunk.content
+                        }
+                    )
+        # todo: updates: Graph / Node / Interrupt
+        elif part['type'] == 'updates':
+            updates = part['data']
+            # 普通Node Update
+            for node_name in updates:
+                if node_name == '__interrupt__':
+                    continue
+                yield make_event(
+                    'node',
+                    {
+                        'node': node_name
+                    }
+                )
+            # Interrupt
+            interrupts = updates.get('__interrupt__')
+            if interrupts:
+                interrupt_info = interrupts[0]
+                yield make_event(
+                    'interrupt',
+                    {
+                        'conversation_id': conversation.id,
+                        'interrupt_id': interrupt_info.id,
+                        'interrupt_value': interrupt_info.value
+                    }
+                )
+    # 12. Streaming结束后，从Checkpoint获取最终State
+    final_state = await graph.aget_state(config)
+    result_messages = final_state.values.get('messages', [])
+    # 13. Graph当前是否停在Interrupt
+    if final_state.interrupts:
+        new_messages = result_messages[initial_message_count:]
+        for msg in new_messages:
+            await save_langchain_message(
+                db=db,
+                conversation_id=conversation.id,
+                message=msg
+            )
+        await save_messages(
+            redis=redis,
+            conversation_id=conversation.id,
+            messages=new_messages
+        )
+        yield make_event(
+            'done',
+            {
+                'conversation_id': conversation.id,
+                'status': 'waiting_approval'
+            }
+        )
+        return
+    # 14. 正常结束，保存本次消息
+    new_messages = result_messages[initial_message_count:]
+    for msg in new_messages:
+        await save_langchain_message(
+            db=db,
+            conversation_id=conversation.id,
+            message=msg
+        )
+    await save_messages(
+        redis=redis,
+        conversation_id=conversation.id,
+        messages=new_messages
+    )
+    yield make_event(
+        'done',
+        {
+            'conversation_id': conversation.id,
+            'status': 'completed'
+        }
     )
