@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.exceptions.base import BusinessException
-from app.graph.agent import create_agent_graph
+from app.graph.workflow import create_workflow_graph
 from app.models.conversation import Conversation
 from app.services.context import select_messages_by_token_budget
 from app.services.memory import create_conversation, get_messages, save_langchain_message
@@ -26,7 +26,9 @@ HISTORY_TOKEN_BUDGET = 6000
 class ChatResult:
     conversation_id: int
     answer: str
-    status: Literal['completed', 'waiting_approval']
+    status: Literal['completed', 'waiting_approval', 'need_more_info']
+    intent: Literal['knowledge', 'ticket', 'general'] | None = None
+    ticket_id: int | None = None
     interrupt_id: str | None = None
     interrupt_value: dict[str, Any] | None = None
 
@@ -51,14 +53,13 @@ async def _get_conversation(
     return conversation
 
 
-async def chat(
+async def _prepare_chat_context(
         db: AsyncSession,
         redis: Redis,
         message: str,
         user_id: int,
         conversation_id: int | None
-) -> ChatResult:
-    # 1. 获取/创建 Conversation
+):
     if conversation_id is None:
         conversation = await create_conversation(
             db=db,
@@ -70,53 +71,97 @@ async def chat(
             conversation_id=conversation_id,
             user_id=user_id
         )
-    # 2. 如果历史消息达到条件，先更新Summary
     await update_summary(
         db=db,
         conversation=conversation
     )
-    # 3. 优先从Redis获取短期Memory
     history = await get_recent_messages(
         redis=redis,
         conversation_id=conversation.id
     )
-    # 4. Redis未命中，从PostgreSQL恢复
     if not history:
         history = await get_messages(
             db=db,
             conversation_id=conversation.id,
             limit=HISTORY_MESSAGE_LIMIT
         )
-        # PostgreSQL是长期Memory的Source of Truth。
-        # 回溯成功后重新建立Redis Short-term Memory。
         await rebuild_memory(
             redis=redis,
             conversation_id=conversation.id,
             messages=history
         )
-    # 5. 根据 Token Budget 筛选历史
     history = select_messages_by_token_budget(
         messages=history,
         token_budget=HISTORY_TOKEN_BUDGET,
         token_counter=estimate_messages_tokens
     )
-    # 6. 创建当前用户消息
-    current_user_message = HumanMessage(
-        content=message
+
+    return (
+        conversation,
+        history,
+        HumanMessage(content=message)
     )
-    # 7. 创建LangGraph
-    graph = create_agent_graph(db=db)
+
+
+async def _persist_messages(
+        db: AsyncSession,
+        redis: Redis,
+        conversation_id: int,
+        messages: list[Any]
+) -> None:
+    for msg in messages:
+        await save_langchain_message(
+            db=db,
+            conversation_id=conversation_id,
+            message=msg,
+        )
+    await save_messages(
+        redis=redis,
+        conversation_id=conversation_id,
+        messages=messages
+    )
+
+
+def _normal_status(value: Any) -> Literal['completed', 'need_more_info']:
+    if value == 'need_more_info':
+        return 'need_more_info'
+    return 'completed'
+
+
+def _make_sse_event(
+        event: str,
+        data: dict[str, Any]
+) -> str:
+    return (
+        f'event: {event}\n'
+        f'data: '
+        f'{json.dumps(data, ensure_ascii=False)}\n\n'
+    )
+
+
+# todo: 普通非流式 Chat
+async def chat(
+        db: AsyncSession,
+        redis: Redis,
+        message: str,
+        user_id: int,
+        conversation_id: int | None
+) -> ChatResult:
+    conversation, history, current_user_message = await _prepare_chat_context(
+        db=db,
+        redis=redis,
+        message=message,
+        user_id=user_id,
+        conversation_id=conversation_id
+    )
+    graph = create_workflow_graph(db=db)
     thread_id = f'conversation:{conversation.id}'
     config = {
         'configurable': {
             'thread_id': thread_id
         }
     }
-    # 8. 检查当前Graph State
-    checkpoint = await graph.aget_state(
-        config
-    )
-    # 如果之前已经暂停等待审批，不允许用户绕过审批继续提交新的消息。
+    checkpoint = await graph.aget_state(config)
     if checkpoint.interrupts:
         raise BusinessException(
             message='Conversation has a pending approval',
@@ -124,13 +169,14 @@ async def chat(
         )
     checkpoint_messages = checkpoint.values.get('messages', [])
     has_checkpoint = bool(checkpoint_messages)
-    # 9. 确定本次Graph执行开始之前已有多少消息
     if has_checkpoint:
         initial_message_count = len(checkpoint_messages)
         graph_input = {
             'messages': [current_user_message],
             'context_messages': history,
             'summary': conversation.summary,
+            'user_id': user_id,
+            'conversation_id': conversation.id
         }
     else:
         initial_message_count = len(history)
@@ -138,63 +184,52 @@ async def chat(
             'messages': [*history, current_user_message],
             'context_messages': history,
             'summary': conversation.summary,
+            'user_id': user_id,
+            'conversation_id': conversation.id
         }
-    # 10. 执行Graph
     result = await graph.ainvoke(
         graph_input,
         config
     )
-    # 11. 检查是否被interrupt
     interrupts = result.get('__interrupt__', ())
     if interrupts:
         interrupt_info = interrupts[0]
-        # 通过Checkpoint读取中断时真正保存下来的State
         interrupted_state = await graph.aget_state(config)
         interrupted_messages = interrupted_state.values.get('messages', [])
-        # 保存本次已经产生的业务信息 Human + AI（tool_call）
         new_messages = interrupted_messages[initial_message_count:]
-        for msg in new_messages:
-            await save_langchain_message(
-                db=db,
-                conversation_id=conversation.id,
-                message=msg
-            )
-        await save_messages(
+        await _persist_messages(
+            db=db,
             redis=redis,
             conversation_id=conversation.id,
             messages=new_messages
         )
-
         return ChatResult(
             conversation_id=conversation.id,
             answer='等待人工确认。',
             status='waiting_approval',
+            intent=result.get('intent'),
+            ticket_id=result.get('ticket_id'),
             interrupt_id=interrupt_info.id,
             interrupt_value=interrupt_info.value
         )
-
-    # 12. Graph正常结束
-    result_messages = result['messages']
+    result_messages = result.get('messages', [])
     new_messages = result_messages[initial_message_count:]
-    for msg in new_messages:
-        await save_langchain_message(
-            db=db,
-            conversation_id=conversation.id,
-            message=msg
-        )
-    await save_messages(
+    await _persist_messages(
+        db=db,
         redis=redis,
         conversation_id=conversation.id,
         messages=new_messages
     )
-
     return ChatResult(
         conversation_id=conversation.id,
         answer=result_messages[-1].content,
-        status='completed'
+        status=_normal_status(result.get('workflow_status')),
+        intent=result.get('intent'),
+        ticket_id=result.get('ticket_id')
     )
 
 
+# todo: Resume
 async def resume_chat(
         db: AsyncSession,
         redis: Redis,
@@ -210,7 +245,7 @@ async def resume_chat(
         user_id=user_id
     )
     # 2. 创建Graph
-    graph = create_agent_graph(db=db)
+    graph = create_workflow_graph(db=db)
     thread_id = f'conversation:{conversation.id}'
     config = {
         'configurable': {
@@ -254,19 +289,16 @@ async def resume_chat(
             conversation_id=conversation.id,
             answer='仍然等待人工确认',
             status='waiting_approval',
+            intent=result.get('intent'),
+            ticket_id=result.get('ticket_id'),
             interrupt_id=interrupt_info.id,
             interrupt_value=interrupt_info.value
         )
 
-    result_messages = result['messages']
+    result_messages = result.get('messages', [])
     new_messages = result_messages[before_message_count:]
-    for msg in new_messages:
-        await save_langchain_message(
-            db=db,
-            conversation_id=conversation.id,
-            message=msg
-        )
-    await save_messages(
+    await _persist_messages(
+        db=db,
         redis=redis,
         conversation_id=conversation.id,
         messages=new_messages
@@ -275,10 +307,13 @@ async def resume_chat(
     return ChatResult(
         conversation_id=conversation.id,
         answer=result_messages[-1].content,
-        status='completed'
+        status=_normal_status(result.get('workflow_status')),
+        intent=result.get('intent'),
+        ticket_id=result.get('ticket_id')
     )
 
 
+# todo: Streaming
 async def stream_chat(
         db: AsyncSession,
         redis: Redis,
@@ -286,100 +321,55 @@ async def stream_chat(
         user_id: int,
         conversation_id: int | None
 ) -> AsyncIterator[str]:
-    # 1 获取/创建Conversation
-    if conversation_id is None:
-        conversation = await create_conversation(
-            db=db,
-            user_id=user_id
-        )
-    else:
-        conversation = await _get_conversation(
-            db=db,
-            conversation_id=conversation_id,
-            user_id=user_id
-        )
-    # 2. 更新Summary
-    await update_summary(
+    # 1. 数据准备
+    conversation, history, current_user_message = await _prepare_chat_context(
         db=db,
-        conversation=conversation
-    )
-    # 3. Redis获取短期Memory
-    history = await get_recent_messages(
         redis=redis,
-        conversation_id=conversation.id
+        message=message,
+        user_id=user_id,
+        conversation_id=conversation_id
     )
-    # 4. Redis MISS -> PostgreSQL
-    if not history:
-        history = await get_messages(
-            db=db,
-            conversation_id=conversation.id,
-            limit=HISTORY_MESSAGE_LIMIT
-        )
-        await rebuild_memory(
-            redis=redis,
-            conversation_id=conversation.id,
-            messages=history
-        )
-    # 5. Token Budget
-    history = select_messages_by_token_budget(
-        messages=history,
-        token_budget=HISTORY_TOKEN_BUDGET,
-        token_counter=estimate_messages_tokens
-    )
-    # 6. 当前User Message
-    current_user_message = HumanMessage(
-        content=message
-    )
-    # 7. 创建Graph
-    graph = create_agent_graph(db=db)
+    # 2. 创建Graph
+    graph = create_workflow_graph(db=db)
     thread_id = f'conversation:{conversation.id}'
     config = {
         'configurable': {
             'thread_id': thread_id
         }
     }
-    # 8. 检查当前Graph State
+    # 3. 检查当前Graph State
     checkpoint = await graph.aget_state(config)
     if checkpoint.interrupts:
-        yield (
-            'event: error\n'
-            'data: '
-            + json.dumps(
-                {
-                    'code': 'APPROVAL_PENDING',
-                    'message': 'Conversation has a pending approval'
-                },
-                ensure_ascii=False
-            )
-            + '\n\n'
+        yield _make_sse_event(
+            'error',
+            {
+                'code': 'APPROVAL_PENDING',
+                'message': 'Conversation has a pending approval'
+            }
         )
         return
     checkpoint_messages = checkpoint.values.get('messages', [])
     has_checkpoint = bool(checkpoint_messages)
-    # 9. 准备本次Graph输入
+    # 4. 准备本次Graph输入
     if has_checkpoint:
         initial_message_count = len(checkpoint_messages)
         graph_input = {
             'messages': [current_user_message],
             'context_messages': history,
-            'summary': conversation.summary
+            'summary': conversation.summary,
+            'user_id': user_id,
+            'conversation_id': conversation.id
         }
     else:
         initial_message_count = len(history)
         graph_input = {
             'messages': [*history, current_user_message],
             'context_messages': history,
-            'summary': conversation.summary
+            'summary': conversation.summary,
+            'user_id': user_id,
+            'conversation_id': conversation.id
         }
-
-    # 10. SSE 辅助函数
-    def make_event(event: str, data: dict) -> str:
-        return (
-            f'event: {event}\n'
-            f'data: {json.dumps(data, ensure_ascii=False)}\n\n'
-        )
-
-    # 11. Graph Streaming
+    # 5. Graph Streaming
     # astream()支持多个stream_mode同时使用
     # messages：LLM token流
     # updates：节点更新流
@@ -394,9 +384,14 @@ async def stream_chat(
         # todo: messages: LLM Token Streaming
         if part['type'] == 'messages':
             message_chunk, metadata = part['data']
+            # Workflow中Router / Ticket Extract也可能产生内部LLM stream。
+            # 这些不是给用户展示的token。
+            # 只把真正面向用户的Agent / Knowledge Answer的token推给前端
+            if metadata.get('langgraph_node') not in {'agent', 'knowledge_answer'}:
+                continue
             if isinstance(message_chunk, AIMessageChunk):
                 if isinstance(message_chunk.content, str) and message_chunk.content:
-                    yield make_event(
+                    yield _make_sse_event(
                         'token',
                         {
                             'content': message_chunk.content
@@ -409,7 +404,7 @@ async def stream_chat(
             for node_name in updates:
                 if node_name == '__interrupt__':
                     continue
-                yield make_event(
+                yield _make_sse_event(
                     'node',
                     {
                         'node': node_name
@@ -419,7 +414,7 @@ async def stream_chat(
             interrupts = updates.get('__interrupt__')
             if interrupts:
                 interrupt_info = interrupts[0]
-                yield make_event(
+                yield _make_sse_event(
                     'interrupt',
                     {
                         'conversation_id': conversation.id,
@@ -427,48 +422,42 @@ async def stream_chat(
                         'interrupt_value': interrupt_info.value
                     }
                 )
-    # 12. Streaming结束后，从Checkpoint获取最终State
+    # 6. Streaming结束后，从Checkpoint获取最终State
     final_state = await graph.aget_state(config)
     result_messages = final_state.values.get('messages', [])
-    # 13. Graph当前是否停在Interrupt
+    # 7. Graph当前是否停在Interrupt
     if final_state.interrupts:
         new_messages = result_messages[initial_message_count:]
-        for msg in new_messages:
-            await save_langchain_message(
-                db=db,
-                conversation_id=conversation.id,
-                message=msg
-            )
-        await save_messages(
+        await _persist_messages(
+            db=db,
             redis=redis,
             conversation_id=conversation.id,
             messages=new_messages
         )
-        yield make_event(
+        yield _make_sse_event(
             'done',
             {
                 'conversation_id': conversation.id,
-                'status': 'waiting_approval'
+                'status': 'waiting_approval',
+                'intent': final_state.values.get('intent'),
+                'ticket_id': final_state.values.get('ticket_id')
             }
         )
         return
-    # 14. 正常结束，保存本次消息
+    # 8. 正常结束，保存本次消息
     new_messages = result_messages[initial_message_count:]
-    for msg in new_messages:
-        await save_langchain_message(
-            db=db,
-            conversation_id=conversation.id,
-            message=msg
-        )
-    await save_messages(
+    await _persist_messages(
+        db=db,
         redis=redis,
         conversation_id=conversation.id,
         messages=new_messages
     )
-    yield make_event(
+    yield _make_sse_event(
         'done',
         {
             'conversation_id': conversation.id,
-            'status': 'completed'
+            'status': _normal_status(final_state.values.get('workflow_status')),
+            'intent': final_state.values.get('intent'),
+            'ticket_id': final_state.values.get('ticket_id')
         }
     )

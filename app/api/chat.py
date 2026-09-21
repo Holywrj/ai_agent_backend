@@ -36,6 +36,8 @@ async def chat_completion(
         conversation_id=result.conversation_id,
         answer=result.answer,
         status=result.status,
+        intent=result.intent,
+        ticket_id=result.ticket_id,
         interrupt_id=result.interrupt_id,
         interrupt_value=result.interrupt_value
     )
@@ -64,6 +66,8 @@ async def resume_chat_completion(
         conversation_id=result.conversation_id,
         answer=result.answer,
         status=result.status,
+        intent=result.intent,
+        ticket_id=result.ticket_id,
         interrupt_id=result.interrupt_id,
         interrupt_value=result.interrupt_value
     )

@@ -1,4 +1,7 @@
+from typing import Any
+
 from langchain_core.messages import SystemMessage, AnyMessage, HumanMessage, AIMessage
+from langchain_core.tools import BaseTool
 from langgraph.errors import NodeError
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -13,8 +16,7 @@ SYSTEM_PROMPT = (
     "你是一个专业的 AI 助手。"
     "回答用户问题时要准确、简洁。"
     "如果需要查询实时天气，可以使用天气工具。"
-    "如果用户的问题涉及内部知识、业务规则、"
-    "产品文档或知识库内容，可以使用知识库搜索工具。"
+    "如果用户的问题涉及内部知识、业务规则、产品文档或知识库内容，可以使用知识库搜索工具。"
 
     "如果用户明确要求删除知识库文档，"
     "你必须调用 delete_knowledge_document 工具。"
@@ -83,34 +85,38 @@ def handle_agent_error(
     }
 
 
-def create_agent_graph(
-        db: AsyncSession
-):
-    # 1. 获取当前项目已有的Tools
-    tools = get_all_tools(db=db)
-    # 2. 让LLM具备Tool Calling能力
+def add_agent_branch(
+        builder: Any,
+        db: AsyncSession,
+        tools: list[BaseTool] | None = None
+) -> None:
+    """
+    向外层Workflow注册通用Agent分支。
+
+    负责：
+    - 普通对话
+    - 天气查询
+    - 删除知识库等需要LLM自主决定工具调用的场景
+    """
+    if tools is None:
+        tools = get_all_tools(db=db)
     model = create_llm().bind_tools(tools)
 
-    # 3. Agent Node
     async def call_model(
             state: AgentState
     ) -> dict:
-        # 找到本轮对话的起点。
-        # Graph State中可能保存着以前很多轮消息，但本次调用真正新增的是最后一个HumanMessage
-        # 以及后面的Tool/AI消息
         current_turn_start = 0
         for index in range(len(state['messages']) - 1, -1, -1):
             if isinstance(state['messages'][index], HumanMessage):
                 current_turn_start = index
                 break
-        current_turn_message = state['messages'][current_turn_start:]
+        current_turn_messages = state['messages'][current_turn_start:]
         prompt_messages = [
             SystemMessage(
                 content=SYSTEM_PROMPT
             )
         ]
-        # summary不放进message state，每次从当前state单独构造，避免摘要更新后使用旧摘要
-        if state['summary']:
+        if state.get('summary'):
             prompt_messages.append(
                 SystemMessage(
                     content=(
@@ -122,30 +128,20 @@ def create_agent_graph(
                     )
                 )
             )
-        # Redis / PostgreSQL 提供的当前上下文
-        prompt_messages.extend(state['context_messages'])
-        # 当前这一轮的Human / Tool / AI消息
-        prompt_messages.extend(current_turn_message)
+        prompt_messages.extend(state.get('context_messages', []))
+        prompt_messages.extend(current_turn_messages)
+        response = await model.ainvoke(prompt_messages)
 
-        response = await model.ainvoke(
-            prompt_messages
-        )
         return {
             'messages': [response]
         }
 
-    # 4. 创建Graph Builder
-    builder = StateGraph(AgentState)
-    # 5. 注册Agent Node
     builder.add_node(
         'agent',
         call_model,
         retry_policy=AGENT_RETRY_POLICY,
         error_handler=handle_agent_error
     )
-    # 6. 注册ToolNode
-    # handle_tool_errors=True,
-    # Tool 执行出现异常时，不让整个 Graph 直接炸掉，而是把异常转换成 ToolMessage，让 Agent 看见这个工具执行失败。
     builder.add_node(
         'tools',
         ToolNode(
@@ -153,20 +149,28 @@ def create_agent_graph(
             handle_tool_errors=True
         )
     )
-    # 7. Graph开始 -> Agent
-    builder.add_edge(START, 'agent')
-    # 8. Agent -> 根据Tool Calling结果决定下一步
     builder.add_conditional_edges(
         'agent',
         tools_condition,
         {
             'tools': 'tools',
-            '__end__': END,
+            '__end__': END
         }
     )
-    # 9. Tool执行完 -> 回到Agent
     builder.add_edge('tools', 'agent')
-    # 10. 编译Graph
+
+
+def create_agent_graph(
+        db: AsyncSession
+):
+    """
+    独立创建通用 Agent Graph。
+    保留这个函数，方便后续单独测试 Agent。
+    """
+    builder = StateGraph(AgentState)
+    add_agent_branch(builder, db)
+    builder.add_edge(START, 'agent')
+
     return builder.compile(
         checkpointer=checkpointer
     )
