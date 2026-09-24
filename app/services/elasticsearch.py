@@ -1,43 +1,50 @@
 from elasticsearch import AsyncElasticsearch
+from elasticsearch.helpers import async_bulk
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.elasticsearch import ensure_knowledge_index
 from app.models.knowledge import KnowledgeChunk
 
 
-async def index_knowledge_chunk(
-        client: AsyncElasticsearch,
-        chunk: KnowledgeChunk
-) -> None:
+async def rebuild_knowledge_index(
+        db: AsyncSession,
+        client: AsyncElasticsearch
+) -> int:
+    """
+    将 PostgreSQL 中的全部KnowledgeChunk重建到Elasticsearch
+    """
+    index_name = settings.elasticsearch_knowledge_index
+    # 确保Index存在
     await ensure_knowledge_index(client)
-    # wait_for: 等这次写入对搜索可见以后，再返回
-    await client.index(
-        index=settings.elasticsearch_knowledge_index,
-        id=str(chunk.id),
-        document={
-            'chunk_id': chunk.id,
-            'document_id': chunk.document_id,
-            'chunk_index': chunk.chunk_index,
-            'content': chunk.content,
-        },
+    # 查询Chunk
+    result = await db.execute(
+        select(KnowledgeChunk)
+        .order_by(KnowledgeChunk.id)
+    )
+    chunks = result.scalars().all()
+    if not chunks:
+        return 0
+    # PostgreSQL -> Elasticsearch Document
+    actions = [
+        {
+            '_index': index_name,
+            '_id': str(chunk.id),
+            '_source': {
+                'chunk_id': chunk.id,
+                'document_id': chunk.document_id,
+                'chunk_index': chunk.chunk_index,
+                'content': chunk.content,
+            },
+        }
+        for chunk in chunks
+    ]
+    # 批量写入Elasticsearch
+    success, errors = await async_bulk(
+        client,
+        actions,
         refresh='wait_for',
     )
 
-
-async def search_knowledge_bm25(
-        client: AsyncElasticsearch,
-        query: str,
-        top_k: int = 5
-) -> list[dict]:
-    response = await client.search(
-        index=settings.elasticsearch_knowledge_index,
-        # 在 content 这个 text 字段上，对用户输入执行全文匹配，并按照相关性排序
-        query={
-            'match': {
-                'content': query,
-            }
-        },
-        size=top_k,
-    )
-
-    return response['hits']['hits']
+    return success

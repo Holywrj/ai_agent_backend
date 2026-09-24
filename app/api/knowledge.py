@@ -1,13 +1,16 @@
 from pathlib import Path
 
+from elasticsearch import AsyncElasticsearch
 from fastapi import APIRouter, Depends, File, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import get_current_user, get_db
+from app.api.dependencies import get_current_user, get_db, get_elasticsearch
 from app.exceptions.base import BusinessException
 from app.models.user import User
 from app.schemas.knowledge import KnowledgeDocumentCreate, KnowledgeDocumentResponse
+from app.services.elasticsearch import rebuild_knowledge_index
 from app.services.knowledge import delete_document, get_document, ingest_document
+from app.services.retrieval import ElasticsearchBM25Retriever
 
 router = APIRouter(
     prefix='/knowledge/documents',
@@ -82,6 +85,46 @@ async def upload_knowledge_document(
         )
     finally:
         await file.close()
+
+
+@router.post('/reindex')
+async def reindex_knowledge(
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+        client: AsyncElasticsearch = Depends(get_elasticsearch)
+):
+    count = await rebuild_knowledge_index(
+        db=db,
+        client=client
+    )
+
+    return {
+        'indexed_chunks': count
+    }
+
+
+@router.get('/search')
+async def search_knowledge(
+        query: str,
+        top_k: int = 5,
+        client: AsyncElasticsearch = Depends(get_elasticsearch)
+):
+    retriever = ElasticsearchBM25Retriever(
+        client=client,
+        top_k=top_k
+    )
+    documents = await retriever.ainvoke(query)
+    return {
+        'query': query,
+        'mode': 'bm25',
+        'results': [
+            {
+                'content': document.page_content,
+                'metadata': document.metadata,
+            }
+            for document in documents
+        ]
+    }
 
 
 @router.get(

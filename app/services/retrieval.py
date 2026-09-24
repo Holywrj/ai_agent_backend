@@ -1,10 +1,13 @@
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from pydantic import ConfigDict, Field
+from elasticsearch import AsyncElasticsearch
 
 from app.core.embedding import create_embeddings
+from app.core.config import settings
 from app.models.knowledge import KnowledgeChunk
 
 
@@ -65,6 +68,57 @@ class PgVectorRetriever(BaseRetriever):
                         'chunk_id': chunk.id,
                         'chunk_index': chunk.chunk_index,
                         'similarity': similarity
+                    }
+                )
+            )
+
+        return documents
+
+
+class ElasticsearchBM25Retriever(BaseRetriever):
+    client: AsyncElasticsearch = Field(exclude=True)
+    top_k: int = 5
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True
+    )
+
+    def _get_relevant_documents(
+            self,
+            query: str,
+            *,
+            run_manager=None
+    ) -> list[Document]:
+        raise NotImplementedError(
+            'ElasticsearchBM25Retriever only supports async retrieval.'
+        )
+
+    async def _aget_relevant_documents(
+            self,
+            query: str,
+            *,
+            run_manager=None
+    ) -> list[Document]:
+        # 在 content 这个 text 字段上，对用户输入执行全文匹配，并按照相关性排序
+        response = await self.client.search(
+            index=settings.elasticsearch_knowledge_index,
+            query={
+                'match': {
+                    'content': query
+                }
+            },
+            size=self.top_k
+        )
+        documents: list[Document] = []
+        for hit in response['hits']['hits']:
+            source = hit['_source']
+            documents.append(
+                Document(
+                    page_content=source['content'],
+                    metadata={
+                        'document_id': source['document_id'],
+                        'chunk_id': source['chunk_id'],
+                        'chunk_index': source['chunk_index'],
+                        'bm25_score': hit['_score']
                     }
                 )
             )
