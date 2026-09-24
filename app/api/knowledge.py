@@ -1,7 +1,8 @@
 from pathlib import Path
+from typing import Literal
 
 from elasticsearch import AsyncElasticsearch
-from fastapi import APIRouter, Depends, File, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_current_user, get_db, get_elasticsearch
@@ -10,7 +11,7 @@ from app.models.user import User
 from app.schemas.knowledge import KnowledgeDocumentCreate, KnowledgeDocumentResponse
 from app.services.elasticsearch import rebuild_knowledge_index
 from app.services.knowledge import delete_document, get_document, ingest_document
-from app.services.retrieval import ElasticsearchBM25Retriever
+from app.services.retrieval import PgVectorRetriever, ElasticsearchBM25Retriever, HybridRetriever
 
 router = APIRouter(
     prefix='/knowledge/documents',
@@ -106,17 +107,39 @@ async def reindex_knowledge(
 @router.get('/search')
 async def search_knowledge(
         query: str,
-        top_k: int = 5,
+        mode: Literal['vector', 'bm25', 'hybrid'] = Query('vector'),
+        top_k: int = Query(5, ge=1, le=20),
+        db: AsyncSession = Depends(get_db),
         client: AsyncElasticsearch = Depends(get_elasticsearch)
 ):
-    retriever = ElasticsearchBM25Retriever(
-        client=client,
-        top_k=top_k
-    )
+    if mode == 'vector':
+        retriever = PgVectorRetriever(
+            db=db,
+            top_k=top_k
+        )
+    elif mode == 'bm25':
+        retriever = ElasticsearchBM25Retriever(
+            client=client,
+            top_k=top_k
+        )
+    else:
+        vector_retriever = PgVectorRetriever(
+            db=db,
+            top_k=top_k
+        )
+        bm25_retriever = ElasticsearchBM25Retriever(
+            client=client,
+            top_k=top_k
+        )
+        retriever = HybridRetriever(
+            vector_retriever=vector_retriever,
+            bm25_retriever=bm25_retriever,
+            top_k=top_k
+        )
     documents = await retriever.ainvoke(query)
     return {
         'query': query,
-        'mode': 'bm25',
+        'mode': mode,
         'results': [
             {
                 'content': document.page_content,

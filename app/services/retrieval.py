@@ -1,4 +1,5 @@
-from langchain_core.callbacks import CallbackManagerForRetrieverRun
+import asyncio
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.documents import Document
@@ -124,3 +125,63 @@ class ElasticsearchBM25Retriever(BaseRetriever):
             )
 
         return documents
+
+
+class HybridRetriever(BaseRetriever):
+    vector_retriever: PgVectorRetriever = Field(exclude=True)
+    bm25_retriever: ElasticsearchBM25Retriever = Field(exclude=True)
+    top_k: int = 5
+    rrf_k: int = 60
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True
+    )
+
+    def _get_relevant_documents(
+            self,
+            query: str,
+            *,
+            run_manager=None
+    ) -> list[Document]:
+        raise NotImplementedError(
+            'HybridRetriever only supports async retrieval.'
+        )
+
+    async def _aget_relevant_documents(
+            self,
+            query: str,
+            *,
+            run_manager=None
+    ) -> list[Document]:
+        vector_documents, bm25_documents = await asyncio.gather(
+            self.vector_retriever.ainvoke(query),
+            self.bm25_retriever.ainvoke(query)
+        )
+        scores: dict[int, float] = {}
+        documents: dict[int, Document] = {}
+        metadata: dict[int, dict] = {}
+        for rank, document in enumerate(vector_documents, start=1):
+            chunk_id = document.metadata['chunk_id']
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1 / (self.rrf_k + rank)
+            documents[chunk_id] = document
+            metadata.setdefault(chunk_id, {}).update(document.metadata)
+            metadata[chunk_id]['vector_rank'] = rank
+        for rank, document in enumerate(bm25_documents, start=1):
+            chunk_id = document.metadata['chunk_id']
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1 / (self.rrf_k + rank)
+            documents.setdefault(chunk_id, document)
+            metadata.setdefault(chunk_id, {}).update(document.metadata)
+            metadata[chunk_id]['bm25_rank'] = rank
+        ranked_chunk_ids = sorted(scores, key=scores.get, reverse=True)[:self.top_k]
+        results: list[Document] = []
+        for chunk_id in ranked_chunk_ids:
+            results.append(
+                Document(
+                    page_content=documents[chunk_id].page_content,
+                    metadata={
+                        **metadata[chunk_id],
+                        'rrf_score': scores[chunk_id]
+                    }
+                )
+            )
+
+        return results
