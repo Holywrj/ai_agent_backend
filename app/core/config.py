@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     dashscope_base_url: str
     dashscope_embedding_model: str
     dashscope_embedding_dimensions: int
+    dashscope_rerank_base_url: str
+    dashscope_rerank_model: str
 
     model_config = SettingsConfigDict(
         env_file='.env',

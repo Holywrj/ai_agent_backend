@@ -1,6 +1,8 @@
 import json
 from typing import Any, Literal
 
+import httpx
+from elasticsearch import AsyncElasticsearch
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy, default_retry_on, interrupt
@@ -12,7 +14,7 @@ from app.graph.agent import AGENT_RETRY_POLICY, AgentState, add_agent_branch
 from app.schemas.workflow import IntentDecision, TicketDraftExtraction
 from app.services.ticket import create_support_ticket
 from app.tools.knowledge import create_search_knowledge_tool
-from app.tools.registry import RAG_SCORE_THRESHOLD, RAG_TOP_K
+from app.tools.registry import RAG_SCORE_THRESHOLD, RAG_FINAL_TOP_K, RAG_CANDIDATE_TOP_K
 
 WORKFLOW_RETRY_POLICY = RetryPolicy(
     initial_interval=0.5,
@@ -58,15 +60,26 @@ def _recent_context(
 
 
 def create_workflow_graph(
-        db: AsyncSession
+        db: AsyncSession,
+        elasticsearch_client: AsyncElasticsearch,
+        reranker_client: httpx.AsyncClient
 ):
-    router_model = create_llm().with_structured_output(IntentDecision)
-    ticket_model = create_llm().with_structured_output(TicketDraftExtraction)
+    router_model = create_llm(thinking=False).with_structured_output(
+        IntentDecision,
+        method='function_calling'
+    )
+    ticket_model = create_llm(thinking=False).with_structured_output(
+        TicketDraftExtraction,
+        method='function_calling'
+    )
     answer_model = create_llm()
 
     search_knowledge_tool = create_search_knowledge_tool(
         db=db,
-        top_k=RAG_TOP_K,
+        elasticsearch_client=elasticsearch_client,
+        reranker_client=reranker_client,
+        candidate_top_k=RAG_CANDIDATE_TOP_K,
+        final_top_k=RAG_FINAL_TOP_K,
         score_threshold=RAG_SCORE_THRESHOLD,
     )
 
@@ -358,7 +371,12 @@ def create_workflow_graph(
     builder.add_node('create_ticket', create_ticket)
     builder.add_node('cancel_ticket', cancel_ticket)
     # 注册原来的通用Agent
-    add_agent_branch(builder, db=db)
+    add_agent_branch(
+        builder,
+        db=db,
+        elasticsearch_client=elasticsearch_client,
+        reranker_client=reranker_client
+    )
     # START -> Router
     builder.add_edge(START, 'router')
     # Router -> 三个业务分支

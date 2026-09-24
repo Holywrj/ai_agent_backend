@@ -1,5 +1,6 @@
 from collections.abc import AsyncGenerator
 
+import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
@@ -28,6 +29,10 @@ def get_redis(request: Request) -> Redis:
 
 def get_elasticsearch(request: Request) -> AsyncElasticsearch:
     return request.app.state.elasticsearch
+
+
+def get_reranker_client(request: Request) -> httpx.AsyncClient:
+    return request.app.state.reranker_client
 
 
 async def get_current_user(

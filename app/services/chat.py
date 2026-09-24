@@ -3,6 +3,8 @@ from typing import Any, Literal
 import json
 from collections.abc import AsyncIterator
 
+from elasticsearch import AsyncElasticsearch
+import httpx
 from langchain_core.messages import HumanMessage, AIMessageChunk
 from langgraph.types import Command
 from redis.asyncio import Redis
@@ -143,6 +145,8 @@ def _make_sse_event(
 async def chat(
         db: AsyncSession,
         redis: Redis,
+        elasticsearch_client: AsyncElasticsearch,
+        reranker_client: httpx.AsyncClient,
         message: str,
         user_id: int,
         conversation_id: int | None
@@ -154,7 +158,11 @@ async def chat(
         user_id=user_id,
         conversation_id=conversation_id
     )
-    graph = create_workflow_graph(db=db)
+    graph = create_workflow_graph(
+        db=db,
+        elasticsearch_client=elasticsearch_client,
+        reranker_client=reranker_client,
+    )
     thread_id = f'conversation:{conversation.id}'
     config = {
         'configurable': {
@@ -233,6 +241,8 @@ async def chat(
 async def resume_chat(
         db: AsyncSession,
         redis: Redis,
+        elasticsearch_client: AsyncElasticsearch,
+        reranker_client: httpx.AsyncClient,
         conversation_id: int,
         user_id: int,
         interrupt_id: str,
@@ -245,7 +255,11 @@ async def resume_chat(
         user_id=user_id
     )
     # 2. 创建Graph
-    graph = create_workflow_graph(db=db)
+    graph = create_workflow_graph(
+        db=db,
+        elasticsearch_client=elasticsearch_client,
+        reranker_client=reranker_client
+    )
     thread_id = f'conversation:{conversation.id}'
     config = {
         'configurable': {
@@ -317,6 +331,8 @@ async def resume_chat(
 async def stream_chat(
         db: AsyncSession,
         redis: Redis,
+        elasticsearch_client: AsyncElasticsearch,
+        reranker_client: httpx.AsyncClient,
         message: str,
         user_id: int,
         conversation_id: int | None
@@ -330,7 +346,11 @@ async def stream_chat(
         conversation_id=conversation_id
     )
     # 2. 创建Graph
-    graph = create_workflow_graph(db=db)
+    graph = create_workflow_graph(
+        db=db,
+        elasticsearch_client=elasticsearch_client,
+        reranker_client=reranker_client
+    )
     thread_id = f'conversation:{conversation.id}'
     config = {
         'configurable': {

@@ -1,11 +1,13 @@
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 
 from app.api.auth import router as auth_router
 from app.api.users import router as users_router
 from app.api.chat import router as chat_router
 from app.api.knowledge import router as knowledge_router
+from app.core.config import settings
 from app.core.redis import create_redis_client
 from app.core.elasticsearch import create_elasticsearch_client, ensure_knowledge_index
 from app.exceptions.base import BusinessException
@@ -16,20 +18,32 @@ from app.exceptions.handlers import business_exception_handler
 # 价值：它把“资源创建”和“资源清理”放在同一个函数里，并且让框架自动决定什么时候执行两边。
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # fastapi启动前
+    # todo: fastapi启动前
+    # redis
     redis_client = create_redis_client()
     await redis_client.ping()
     # state 是 Starlette 提供的一个用来保存应用级共享状态/对象的容器
     app.state.redis = redis_client
+    # elasticsearch
     elasticsearch_client = create_elasticsearch_client()
     await elasticsearch_client.info()
     await ensure_knowledge_index(elasticsearch_client)
     app.state.elasticsearch = elasticsearch_client
-    # 启动中
+    # httpx.AsyncClient
+    reranker_client = httpx.AsyncClient(
+        base_url=settings.dashscope_rerank_base_url,
+        headers={
+            'Authorization': f'Bearer {settings.dashscope_api_key}',
+            'Content-Type': 'application/json',
+        }
+    )
+    app.state.reranker_client = reranker_client
+    # todo: 启动中
     yield
-    # 关闭后
+    # todo: 关闭后
     await redis_client.aclose()
     await elasticsearch_client.close()
+    await reranker_client.aclose()
 
 
 app = FastAPI(

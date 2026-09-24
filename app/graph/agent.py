@@ -1,5 +1,7 @@
 from typing import Any
 
+import httpx
+from elasticsearch import AsyncElasticsearch
 from langchain_core.messages import SystemMessage, AnyMessage, HumanMessage, AIMessage
 from langchain_core.tools import BaseTool
 from langgraph.errors import NodeError
@@ -88,6 +90,8 @@ def handle_agent_error(
 def add_agent_branch(
         builder: Any,
         db: AsyncSession,
+        elasticsearch_client: AsyncElasticsearch,
+        reranker_client: httpx.AsyncClient,
         tools: list[BaseTool] | None = None
 ) -> None:
     """
@@ -99,7 +103,11 @@ def add_agent_branch(
     - 删除知识库等需要LLM自主决定工具调用的场景
     """
     if tools is None:
-        tools = get_all_tools(db=db)
+        tools = get_all_tools(
+            db=db,
+            elasticsearch_client=elasticsearch_client,
+            reranker_client=reranker_client
+        )
     model = create_llm().bind_tools(tools)
 
     async def call_model(
@@ -161,14 +169,21 @@ def add_agent_branch(
 
 
 def create_agent_graph(
-        db: AsyncSession
+        db: AsyncSession,
+        elasticsearch_client: AsyncElasticsearch,
+        reranker_client: httpx.AsyncClient
 ):
     """
     独立创建通用 Agent Graph。
     保留这个函数，方便后续单独测试 Agent。
     """
     builder = StateGraph(AgentState)
-    add_agent_branch(builder, db)
+    add_agent_branch(
+        builder,
+        db=db,
+        elasticsearch_client=elasticsearch_client,
+        reranker_client=reranker_client
+    )
     builder.add_edge(START, 'agent')
 
     return builder.compile(
