@@ -7,6 +7,7 @@ from app.api.users import router as users_router
 from app.api.chat import router as chat_router
 from app.api.knowledge import router as knowledge_router
 from app.core.redis import create_redis_client
+from app.core.elasticsearch import create_elasticsearch_client, ensure_knowledge_index
 from app.exceptions.base import BusinessException
 from app.exceptions.handlers import business_exception_handler
 
@@ -20,10 +21,15 @@ async def lifespan(app: FastAPI):
     await redis_client.ping()
     # state 是 Starlette 提供的一个用来保存应用级共享状态/对象的容器
     app.state.redis = redis_client
+    elasticsearch_client = create_elasticsearch_client()
+    await elasticsearch_client.info()
+    await ensure_knowledge_index(elasticsearch_client)
+    app.state.elasticsearch = elasticsearch_client
     # 启动中
     yield
     # 关闭后
     await redis_client.aclose()
+    await elasticsearch_client.close()
 
 
 app = FastAPI(

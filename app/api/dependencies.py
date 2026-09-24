@@ -5,6 +5,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from redis.asyncio import Redis
+from elasticsearch import AsyncElasticsearch
 
 from app.core.database import AsyncSessionLocal
 from app.core.jwt import decode_access_token
@@ -23,6 +24,10 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 def get_redis(request: Request) -> Redis:
     return request.app.state.redis
+
+
+def get_elasticsearch(request: Request) -> AsyncElasticsearch:
+    return request.app.state.elasticsearch
 
 
 async def get_current_user(

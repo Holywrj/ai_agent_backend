@@ -7,6 +7,8 @@ class Settings(BaseSettings):
 
     database_url: str
     redis_url: str
+    elasticsearch_url: str
+    elasticsearch_knowledge_index: str = 'knowledge_chunks'
 
     jwt_secret_key: str
     jwt_algorithm: str = 'HS256'
