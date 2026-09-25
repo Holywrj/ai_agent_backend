@@ -3,6 +3,7 @@ from app.models.conversation import Conversation
 from app.models.message import Message
 from app.models.knowledge import KnowledgeDocument, KnowledgeChunk
 from app.models.ticket import Ticket
+from app.models.file import File
 
 # app.models 对外公开内容
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     'KnowledgeDocument',
     'KnowledgeChunk',
     'Ticket',
+    'File',
 ]

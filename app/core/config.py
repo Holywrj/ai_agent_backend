@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     jwt_algorithm: str = 'HS256'
     jwt_access_token_expire_minutes: int = 30
 
+    file_storage_dir: str = 'storage/files'
+    # 10MB
+    file_max_size: int = 10 * 1024 * 1024
+
     deepseek_api_key: str
     deepseek_base_url: str
     deepseek_chat_model: str

@@ -37,3 +37,6 @@ logs/
 build/
 dist/
 *.egg-info/
+
+# Local file storage
+storage/

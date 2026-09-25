@@ -7,6 +7,7 @@ from app.api.auth import router as auth_router
 from app.api.users import router as users_router
 from app.api.chat import router as chat_router
 from app.api.knowledge import router as knowledge_router
+from app.api.files import router as file_router
 from app.core.config import settings
 from app.core.redis import create_redis_client
 from app.core.elasticsearch import create_elasticsearch_client, ensure_knowledge_index
@@ -62,3 +63,4 @@ app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(chat_router)
 app.include_router(knowledge_router)
+app.include_router(file_router)
