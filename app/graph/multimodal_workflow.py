@@ -5,6 +5,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 
 from app.core.checkpointer import checkpointer
 from app.core.llm import create_llm
+from app.exceptions.base import BusinessException
 from app.schemas.multimodal import MultimodalTaskType, MultimodalTaskDecision
 
 
@@ -105,7 +106,14 @@ def create_multimodal_graph():
         }
 
     def route_multimodal(state: MultimodalState) -> MultimodalTaskType:
-        return state.get('task_type') or 'image_qa'
+        task_type = state.get('task_type')
+        if task_type is None:
+            raise BusinessException(
+                message='Multimodal task_type is missing',
+                code='MULTIMODAL_TASK_TYPE_MISSING'
+            )
+
+        return task_type
 
     # todo: 2. image_qa
     async def vision_analyze(state: MultimodalState) -> dict:
