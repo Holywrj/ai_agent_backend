@@ -5,6 +5,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 
 from app.core.checkpointer import checkpointer
 from app.core.llm import create_llm
+from app.core.multimodal import create_multimodal_llm
 from app.exceptions.base import BusinessException
 from app.schemas.multimodal import MultimodalTaskType, MultimodalTaskDecision
 
@@ -66,6 +67,8 @@ def create_multimodal_graph():
         MultimodalTaskDecision,
         method='function_calling'
     )
+    vision_model = create_multimodal_llm()
+    answer_model = create_llm()
 
     # todo: 1. Multimodal Router
     async def multimodal_router(state: MultimodalState) -> dict:
@@ -117,18 +120,73 @@ def create_multimodal_graph():
 
     # todo: 2. image_qa
     async def vision_analyze(state: MultimodalState) -> dict:
-        return {
-            'vision_result': (
-                'TODO：接入 Vision Model 后，'
-                '在这里完成图片理解。'
+        image_url = state.get('image_url')
+        if not image_url:
+            raise BusinessException(
+                message='image_url is missing',
+                code='MULTIMODAL_IMAGE_URL_MISSING'
             )
+        current_message = _latest_human_text(state)
+        prompt = [
+            SystemMessage(
+                content=(
+                    '你是一个专业的视觉理解模型。'
+                    '请仔细分析用户提供的图片，并结合用户问题提取与问题相关的视觉信息。'
+                    '这里只负责视觉分析，不要编造图片中不存在的信息。'
+                    '如果无法从图片中确定某项信息，要明确说明无法确定。'
+                )
+            ),
+            HumanMessage(
+                content=[
+                    {
+                        'type': 'text',
+                        'text': current_message
+                    },
+                    {
+                        'type': 'image_url',
+                        'image_url': {'url': image_url}
+                    }
+                ]
+            )
+        ]
+        response = await vision_model.ainvoke(prompt)
+        if isinstance(response.content, str):
+            vision_result = response.content
+        else:
+            vision_result = str(response.content)
+        return {
+            'vision_result': vision_result
         }
 
     async def vision_answer(state: MultimodalState) -> dict:
-        answer = (
-            'TODO：根据 vision_result '
-            '生成图片问答结果。'
-        )
+        current_message = _latest_human_text(state)
+        vision_result = state.get('vision_result')
+        if not vision_result:
+            raise BusinessException(
+                message='vision_result is missing',
+                code='MULTIMODAL_VISION_RESULT_MISSING'
+            )
+        prompt = [
+            SystemMessage(
+                content=(
+                    '你是一个专业的多模态问答助手。'
+                    '请根据用户的问题和视觉模型提供的分析结果回答用户。'
+                    '不要虚构视觉模型没有提供的信息。'
+                    '回答要准确、直接，必要时说明判断依据。'
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f'用户问题：\n{current_message}\n\n'
+                    f'视觉分析结果：\n{vision_result}'
+                )
+            ),
+        ]
+        response = await answer_model.ainvoke(prompt)
+        if isinstance(response.content, str):
+            answer = response.content
+        else:
+            answer = str(response.content)
 
         return {
             'answer': answer,
