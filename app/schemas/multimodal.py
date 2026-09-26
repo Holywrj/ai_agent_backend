@@ -18,3 +18,7 @@ class MultimodalTaskDecision(BaseModel):
             'visual_knowledge=根据图片理解结果继续查询知识库。'
         )
     )
+
+
+class MultimodalExtractResult(BaseModel):
+    data: dict[str, str]

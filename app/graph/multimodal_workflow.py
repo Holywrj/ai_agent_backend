@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -9,7 +10,7 @@ from app.core.multimodal import create_multimodal_llm
 from app.core.storage import file_storage
 from app.exceptions.base import BusinessException
 from app.graph.state import BaseWorkflowState
-from app.schemas.multimodal import MultimodalTaskType, MultimodalTaskDecision
+from app.schemas.multimodal import MultimodalTaskType, MultimodalTaskDecision, MultimodalExtractResult
 
 
 class MultimodalState(BaseWorkflowState):
@@ -80,6 +81,10 @@ def create_multimodal_graph():
         method='function_calling'
     )
     vision_model = create_multimodal_llm()
+    extract_model = create_llm(thinking=False).with_structured_output(
+        MultimodalExtractResult,
+        method='function_calling'
+    )
     answer_model = create_llm()
 
     # todo: 1. Multimodal Router
@@ -116,7 +121,7 @@ def create_multimodal_graph():
             'task_type': decision.task_type,
             'vision_result': None,
             'structured_result': None,
-            'knowledge_context': None,
+            'multimodal_knowledge_context': None,
             'answer': None,
         }
 
@@ -201,25 +206,82 @@ def create_multimodal_graph():
 
     # todo: 3. image_extract
     async def vision_extract(state: MultimodalState) -> dict:
-        return {
-            'vision_result': (
-                'TODO：接入 Vision Model 后，'
-                '在这里完成图片内容理解。'
+        current_message = _latest_human_text(state)
+        image_contents = await _build_image_contents(state)
+        prompt = [
+            SystemMessage(
+                content=(
+                    '你是一个专业的视觉信息提取模型。'
+                    '请仔细阅读用户提供的图片。'
+                    '重点识别图片中的文字、字段、编号、日期、金额、名称等可见信息。'
+                    '请根据用户的问题关注需要提取的内容。'
+                    '这里只负责理解和提取图片信息，不需要输出最终结构化 JSON。'
+                    '不要编造图片中不存在的信息。'
+                    '无法确认的内容请明确说明。'
+                )
+            ),
+            HumanMessage(
+                content=[
+                    {
+                        'type': 'text',
+                        'text': current_message
+                    },
+                    *image_contents
+                ]
             )
+        ]
+        response = await vision_model.ainvoke(prompt)
+        if isinstance(response.content, str):
+            vision_result = response.content
+        else:
+            vision_result = str(response.content)
+
+        return {
+            'vision_result': vision_result
         }
 
     async def structured_result(state: MultimodalState) -> dict:
-        result = {
-            'status': 'todo',
-            'message': (
-                'TODO：使用 Vision Model + '
-                'Structured Output 生成结构化结果。'
+        current_message = _latest_human_text(state)
+        vision_result = state.get('vision_result')
+        if not vision_result:
+            raise BusinessException(
+                message='vision_result is missing',
+                code='MULTIMODAL_VISION_RESULT_MISSING'
             )
-        }
-        answer = 'TODO: 图片结构化提取完成。'
+        prompt = [
+            SystemMessage(
+                content=(
+                    '你是一个结构化信息提取助手。'
+                    '请根据用户的问题和视觉模型提供的分析结果，'
+                    '提取用户明确要求的信息。'
+                    '只输出符合结构要求的数据。'
+                    '不要补充视觉分析中不存在的信息。'
+                    '所有字段值使用字符串表示。'
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f'用户要求：\n{current_message}\n\n'
+                    f'视觉分析结果：\n{vision_result}'
+                )
+            )
+        ]
+        result = await extract_model.ainvoke(prompt)
+        if not isinstance(result, MultimodalExtractResult):
+            raise BusinessException(
+                message='Structured extraction result is invalid',
+                code='MULTIMODAL_STRUCTURED_RESULT_INVALID'
+            )
+        data = result.data
+        # indent，每层缩进空格数
+        answer = json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2
+        )
 
         return {
-            'structured_result': result,
+            'structured_result': data,
             'answer': answer,
             'messages': [
                 AIMessage(content=answer)
@@ -237,7 +299,7 @@ def create_multimodal_graph():
 
     async def knowledge_retrieval(state: MultimodalState) -> dict:
         return {
-            'knowledge_context': (
+            'multimodal_knowledge_context': (
                 'TODO：使用 vision_result '
                 '调用当前 Knowledge Retrieval。'
             )

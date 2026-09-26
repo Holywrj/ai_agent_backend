@@ -71,8 +71,8 @@ def create_workflow_graph(
         TicketDraftExtraction,
         method='function_calling'
     )
-    answer_model = create_llm()
     multimodal_graph = create_multimodal_graph()
+    answer_model = create_llm()
 
     search_knowledge_tool = create_search_knowledge_tool(
         db=db,
