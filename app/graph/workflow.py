@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.checkpointer import checkpointer
 from app.core.llm import create_llm
 from app.graph.agent import AGENT_RETRY_POLICY, AgentState, add_agent_branch
+from app.graph.multimodal_workflow import create_multimodal_graph
 from app.schemas.workflow import IntentDecision, TicketDraftExtraction
 from app.services.ticket import create_support_ticket
 from app.tools.knowledge import create_search_knowledge_tool
@@ -32,7 +33,8 @@ class WorkflowState(AgentState):
     """
     user_id: int
     conversation_id: int
-    intent: Literal['knowledge', 'ticket', 'general'] | None
+    attachments: list[dict[str, Any]]
+    intent: Literal['knowledge', 'ticket', 'general', 'multimodal'] | None
     knowledge_context: str | None
     ticket_draft: dict[str, Any] | None
     ticket_approved: bool | None

@@ -28,6 +28,7 @@ async def chat_completion(
         elasticsearch_client: AsyncElasticsearch = Depends(get_elasticsearch),
         reranker_client: httpx.AsyncClient = Depends(get_reranker_client)
 ):
+    file_ids = [attachment.file_id for attachment in chat_data.attachments]
     result = await chat(
         db=db,
         redis=redis,
@@ -35,7 +36,8 @@ async def chat_completion(
         reranker_client=reranker_client,
         message=chat_data.message,
         user_id=current_user.id,
-        conversation_id=chat_data.conversation_id
+        conversation_id=chat_data.conversation_id,
+        file_ids=file_ids
     )
 
     return ChatResponse(
@@ -94,6 +96,7 @@ async def chat_stream(
         elasticsearch_client: AsyncElasticsearch = Depends(get_elasticsearch),
         reranker_client: httpx.AsyncClient = Depends(get_reranker_client)
 ):
+    file_ids = [attachment.file_id for attachment in chat_data.attachments]
     # StreamingResponse, 把一个 Python 可迭代的数据流，包装成一个 HTTP 流式响应
     # medis_type -> Content-Type, 'text/event-stream' -> Server-Sent Events（SSE）流
     return StreamingResponse(
@@ -104,7 +107,8 @@ async def chat_stream(
             reranker_client=reranker_client,
             message=chat_data.message,
             user_id=current_user.id,
-            conversation_id=chat_data.conversation_id
+            conversation_id=chat_data.conversation_id,
+            file_ids=file_ids
         ),
         media_type='text/event-stream',
         headers={

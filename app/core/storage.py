@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 from pathlib import Path
 from typing import BinaryIO
@@ -109,6 +110,21 @@ class FileStorage:
             self._read_bytes_sync,
             storage_key
         )
+
+    async def get_model_input(
+            self,
+            storage_key: str,
+            mime_type: str
+    ) -> str:
+        """
+        获取模型可以直接使用的图片输入。
+        当前本地存储使用Base64 Data URL。
+        未来对象存储可以改为返回可访问的URL。
+        """
+        file_bytes = await self.read_bytes(storage_key)
+        image_base64 = base64.b64encode(file_bytes).decode('ascii')
+
+        return f'data:{mime_type};base64,{image_base64}'
 
     def _delete_sync(
             self,

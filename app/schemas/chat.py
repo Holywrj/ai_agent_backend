@@ -1,11 +1,17 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class ChatAttachment(BaseModel):
+    file_id: int
 
 
 class ChatRequest(BaseModel):
     conversation_id: int | None = None
     message: str
+    # 每次创建 ChatRequest 时生成一个新的 list, 避免可变默认值
+    attachments: list[ChatAttachment] = Field(default_factory=list)
 
 
 class ChatResumeRequest(BaseModel):

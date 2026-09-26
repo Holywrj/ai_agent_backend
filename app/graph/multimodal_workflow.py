@@ -6,6 +6,7 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from app.core.checkpointer import checkpointer
 from app.core.llm import create_llm
 from app.core.multimodal import create_multimodal_llm
+from app.core.storage import file_storage
 from app.exceptions.base import BusinessException
 from app.schemas.multimodal import MultimodalTaskType, MultimodalTaskDecision
 
@@ -14,29 +15,20 @@ class MultimodalState(MessagesState):
     """
     Multimodal Workflow 的 State。
 
-    messages:
-        LangGraph 当前执行中的消息状态。
-    task_type:
-        当前多模态业务类型。
-    image_url:
-        当前需要处理的图片资源地址。
-        第一阶段保存资源引用，不直接保存图片二进制。
-    image_mime_type:
-        图片 MIME 类型，例如 image/png、image/jpeg。
-    vision_result:
-        Vision Model 产生的视觉理解结果。
-    structured_result:
-        图片结构化提取后的业务结果。
-    knowledge_context:
-        visual_knowledge 分支中的知识库检索结果。
-    answer:
-        当前 Multimodal Workflow 的最终业务结果。
+    messages: LangGraph 当前执行中的消息状态
+    user_id: 当前用户ID
+    conversation_id: 当前会话ID
+    attachments: 当前多模态请求关联的文件资源引用。每个附近包含file_id、storage_key、mime_type
+    task_type: 当前多模态业务类型
+    vision_result: Vision Model 产生的视觉理解结果
+    structured_result: 图片结构化提取后的业务结果
+    knowledge_context: visual_knowledge 分支中的知识库检索结果
+    answer: 当前 Multimodal Workflow 的最终业务结果
     """
     user_id: int | None
     conversation_id: int | None
+    attachments: list[dict[str, Any]]
     task_type: MultimodalTaskType | None
-    image_url: str | None
-    image_mime_type: str | None
     vision_result: str | None
     structured_result: dict[str, Any] | None
     knowledge_context: str | None
@@ -57,6 +49,32 @@ def _latest_human_text(
             return str(message.content)
 
     return ''
+
+
+async def _build_image_contents(
+        state: MultimodalState
+) -> list[dict[str, Any]]:
+    """
+    将当前MultimodalState中的图片附件转换成模型可以使用的image_url内容
+    """
+    attachments = state.get('attachments') or []
+    if not attachments:
+        raise BusinessException(
+            message='Multimodal attachments are missing',
+            code='MULTIMODAL_ATTACHMENTS_MISSING'
+        )
+    image_contents: list[dict[str, Any]] = []
+    for attachment in attachments:
+        image_url = await file_storage.get_model_input(
+            storage_key=attachment['storage_key'],
+            mime_type=attachment['mime_type']
+        )
+        image_contents.append({
+            'type': 'image_url',
+            'image_url': {'url': image_url}
+        })
+
+    return image_contents
 
 
 def create_multimodal_graph():
@@ -120,13 +138,8 @@ def create_multimodal_graph():
 
     # todo: 2. image_qa
     async def vision_analyze(state: MultimodalState) -> dict:
-        image_url = state.get('image_url')
-        if not image_url:
-            raise BusinessException(
-                message='image_url is missing',
-                code='MULTIMODAL_IMAGE_URL_MISSING'
-            )
         current_message = _latest_human_text(state)
+        image_contents = await _build_image_contents(state)
         prompt = [
             SystemMessage(
                 content=(
@@ -142,10 +155,7 @@ def create_multimodal_graph():
                         'type': 'text',
                         'text': current_message
                     },
-                    {
-                        'type': 'image_url',
-                        'image_url': {'url': image_url}
-                    }
+                    *image_contents
                 ]
             )
         ]

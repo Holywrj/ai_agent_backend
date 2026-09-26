@@ -19,6 +19,7 @@ from app.services.memory import create_conversation, get_messages, save_langchai
 from app.services.redis_memory import get_recent_messages, rebuild_memory, save_messages
 from app.services.summary import update_summary
 from app.services.token_counter import estimate_messages_tokens
+from app.services.file import get_user_file
 
 HISTORY_MESSAGE_LIMIT = 50
 HISTORY_TOKEN_BUDGET = 6000
@@ -53,6 +54,27 @@ async def _get_conversation(
             code='CONVERSATION_NOT_FOUND'
         )
     return conversation
+
+
+async def _prepare_chat_attachments(
+        db: AsyncSession,
+        file_ids: list[int],
+        user_id: int
+) -> list[dict[str, Any]]:
+    attachments:  list[dict[str, Any]] = []
+    for file_id in file_ids:
+        file_record = await get_user_file(
+            db=db,
+            file_id=file_id,
+            user_id=user_id
+        )
+        attachments.append({
+            'file_id': file_record.id,
+            'storage_key': file_record.storage_key,
+            'mime_type': file_record.mime_type,
+        })
+
+    return attachments
 
 
 async def _prepare_chat_context(
@@ -149,7 +171,8 @@ async def chat(
         reranker_client: httpx.AsyncClient,
         message: str,
         user_id: int,
-        conversation_id: int | None
+        conversation_id: int | None,
+        file_ids: list[int] | None = None
 ) -> ChatResult:
     conversation, history, current_user_message = await _prepare_chat_context(
         db=db,
@@ -157,6 +180,11 @@ async def chat(
         message=message,
         user_id=user_id,
         conversation_id=conversation_id
+    )
+    attachments = await _prepare_chat_attachments(
+        db=db,
+        file_ids=file_ids or [],
+        user_id=user_id
     )
     graph = create_workflow_graph(
         db=db,
@@ -184,7 +212,8 @@ async def chat(
             'context_messages': history,
             'summary': conversation.summary,
             'user_id': user_id,
-            'conversation_id': conversation.id
+            'conversation_id': conversation.id,
+            'attachments': attachments,
         }
     else:
         initial_message_count = len(history)
@@ -193,7 +222,8 @@ async def chat(
             'context_messages': history,
             'summary': conversation.summary,
             'user_id': user_id,
-            'conversation_id': conversation.id
+            'conversation_id': conversation.id,
+            'attachments': attachments,
         }
     result = await graph.ainvoke(
         graph_input,
@@ -335,7 +365,8 @@ async def stream_chat(
         reranker_client: httpx.AsyncClient,
         message: str,
         user_id: int,
-        conversation_id: int | None
+        conversation_id: int | None,
+        file_ids: list[int] | None = None
 ) -> AsyncIterator[str]:
     # 1. 数据准备
     conversation, history, current_user_message = await _prepare_chat_context(
@@ -344,6 +375,11 @@ async def stream_chat(
         message=message,
         user_id=user_id,
         conversation_id=conversation_id
+    )
+    attachments = await _prepare_chat_attachments(
+        db=db,
+        file_ids=file_ids or [],
+        user_id=user_id
     )
     # 2. 创建Graph
     graph = create_workflow_graph(
@@ -378,7 +414,8 @@ async def stream_chat(
             'context_messages': history,
             'summary': conversation.summary,
             'user_id': user_id,
-            'conversation_id': conversation.id
+            'conversation_id': conversation.id,
+            'attachments': attachments,
         }
     else:
         initial_message_count = len(history)
@@ -387,7 +424,8 @@ async def stream_chat(
             'context_messages': history,
             'summary': conversation.summary,
             'user_id': user_id,
-            'conversation_id': conversation.id
+            'conversation_id': conversation.id,
+            'attachments': attachments,
         }
     # 5. Graph Streaming
     # astream()支持多个stream_mode同时使用
