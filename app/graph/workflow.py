@@ -71,9 +71,7 @@ def create_workflow_graph(
         TicketDraftExtraction,
         method='function_calling'
     )
-    multimodal_graph = create_multimodal_graph()
     answer_model = create_llm()
-
     search_knowledge_tool = create_search_knowledge_tool(
         db=db,
         elasticsearch_client=elasticsearch_client,
@@ -81,6 +79,9 @@ def create_workflow_graph(
         candidate_top_k=RAG_CANDIDATE_TOP_K,
         final_top_k=RAG_FINAL_TOP_K,
         score_threshold=RAG_SCORE_THRESHOLD,
+    )
+    multimodal_graph = create_multimodal_graph(
+        search_knowledge_tool=search_knowledge_tool
     )
 
     # todo: 1. Intent Router

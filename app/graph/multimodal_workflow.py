@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 
 from app.core.checkpointer import checkpointer
@@ -72,7 +73,9 @@ async def _build_image_contents(
     return image_contents
 
 
-def create_multimodal_graph():
+def create_multimodal_graph(
+        search_knowledge_tool: BaseTool | None = None
+):
     """
     创建独立的Multimodal LangGraph
     """
@@ -290,26 +293,112 @@ def create_multimodal_graph():
 
     # todo: 4. visual_knowledge
     async def vision_understand(state: MultimodalState) -> dict:
-        return {
-            'vision_result': (
-                'TODO：接入 Vision Model 后，'
-                '在这里提取图片语义。'
+        current_message = _latest_human_text(state)
+        image_contents = await _build_image_contents(state)
+        prompt = [
+            SystemMessage(
+                content=(
+                    '你是一个专业的视觉理解模型。'
+                    '请分析用户提供的图片，并提取与知识库检索相关的视觉信息。'
+                    '重点关注图片中的文字、报错信息、产品名称、功能名称、'
+                    '界面元素、设备信息以及其他能够帮助定位知识内容的关键信息。'
+                    '这里只负责理解图片，不要直接回答用户问题。'
+                    '不要编造图片中不存在的信息。'
+                    '无法确认的内容请明确说明。'
+                )
+            ),
+            HumanMessage(
+                content=[
+                    {
+                        'type': 'text',
+                        'text': current_message
+                    },
+                    *image_contents
+                ]
             )
+        ]
+        response = await vision_model.ainvoke(prompt)
+        if isinstance(response.content, str):
+            vision_result = response.content
+        else:
+            vision_result = str(response.content)
+
+        return {
+            'vision_result': vision_result
         }
 
     async def knowledge_retrieval(state: MultimodalState) -> dict:
-        return {
-            'multimodal_knowledge_context': (
-                'TODO：使用 vision_result '
-                '调用当前 Knowledge Retrieval。'
+        if search_knowledge_tool is None:
+            raise BusinessException(
+                message='Knowledge retrieval tool is not configured',
+                code='MULTIMODAL_KNOWLEDGE_TOOL_MISSING'
             )
+        current_message = _latest_human_text(state)
+        vision_result = state.get('vision_result')
+        if not vision_result:
+            raise BusinessException(
+                message='vision_result is missing',
+                code='MULTIMODAL_VISION_RESULT_MISSING'
+            )
+        query = (
+            f'用户问题：\n{current_message}\n\n'
+            f'图片视觉信息：\n{vision_result}'
+        )
+        result = await search_knowledge_tool.ainvoke(
+            {
+                'query': query
+            }
+        )
+
+        return {
+            'multimodal_knowledge_context': result
         }
 
     async def multimodal_answer(state: MultimodalState) -> dict:
-        answer = (
-            'TODO：结合图片理解结果和知识库结果 '
-            '生成最终答案。'
-        )
+        current_message = _latest_human_text(state)
+        vision_result = state.get('vision_result')
+        knowledge_context = state.get('multimodal_knowledge_context')
+        if not vision_result:
+            raise BusinessException(
+                message='vision_result is missing',
+                code='MULTIMODAL_VISION_RESULT_MISSING'
+            )
+        if not knowledge_context:
+            raise BusinessException(
+                message='multimodal_knowledge_context is missing',
+                code='MULTIMODAL_KNOWLEDGE_CONTEXT_MISSING'
+            )
+        prompt = [
+            SystemMessage(
+                content=(
+                    '你是企业内部多模态知识助手。'
+                    '请结合用户问题、图片视觉理解结果和知识库检索结果回答问题。\n\n'
+
+                    '回答规则：'
+                    '1. 知识库检索结果是回答企业内部问题的主要事实依据。'
+                    '2. 涉及企业内部制度、流程、产品、操作规范的问题，'
+                    '只使用知识库中明确提供的信息，不要自行补充内部规则。'
+                    '3. 如果知识库结果不足以回答问题，'
+                    '明确说明当前知识库没有找到足够的信息，不要编造答案。'
+                    '4. 图片视觉结果只用于理解当前图片中的现象、文字和上下文，'
+                    '不能把视觉模型没有识别到的信息当成事实。'
+                    '5. 可以使用通用常识帮助解释问题，但不要把通用常识伪装成企业内部知识。'
+                    '6. 回答要直接、清晰，并尽量针对用户实际问题给出处理建议。'
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f'用户问题：\n{current_message}\n\n'
+                    f'图片视觉理解：\n{vision_result}\n\n'
+                    f'知识库检索结果：\n{knowledge_context}'
+                )
+            )
+        ]
+        response = await answer_model.ainvoke(prompt)
+        if isinstance(response.content, str):
+            answer = response.content
+        else:
+            answer = str(response.content)
 
         return {
             'answer': answer,
