@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.checkpointer import checkpointer
 from app.core.llm import create_llm
-from app.graph.agent import AGENT_RETRY_POLICY, AgentState, add_agent_branch
+from app.graph.agent import AgentState, add_agent_branch
 from app.graph.multimodal_workflow import create_multimodal_graph
 from app.schemas.workflow import IntentDecision, TicketDraftExtraction
 from app.services.ticket import create_support_ticket
@@ -31,9 +31,6 @@ class WorkflowState(AgentState):
     """
     完整业务Workflow State
     """
-    user_id: int
-    conversation_id: int
-    attachments: list[dict[str, Any]]
     intent: Literal['knowledge', 'ticket', 'general', 'multimodal'] | None
     knowledge_context: str | None
     ticket_draft: dict[str, Any] | None
@@ -75,6 +72,7 @@ def create_workflow_graph(
         method='function_calling'
     )
     answer_model = create_llm()
+    multimodal_graph = create_multimodal_graph()
 
     search_knowledge_tool = create_search_knowledge_tool(
         db=db,
@@ -87,6 +85,16 @@ def create_workflow_graph(
 
     # todo: 1. Intent Router
     async def classify_intent(state: WorkflowState) -> dict:
+        attachments = state.get('attachments') or []
+        if attachments:
+            return {
+                'intent': 'multimodal',
+                'workflow_status': None,
+                'knowledge_context': None,
+                'ticket_id': None,
+                'ticket_approved': None
+            }
+
         current_message = _latest_human_text(state)
         existing_ticket_draft = state.get('ticket_draft')
         prompt = [
@@ -141,7 +149,7 @@ def create_workflow_graph(
             'ticket_approved': None,
         }
 
-    def route_intent(state: WorkflowState) -> Literal['knowledge', 'ticket', 'general']:
+    def route_intent(state: WorkflowState) -> Literal['knowledge', 'ticket', 'general', 'multimodal']:
         return state.get('intent') or 'general'
 
     # todo: 2. Knowledge Workflow
@@ -379,16 +387,19 @@ def create_workflow_graph(
         elasticsearch_client=elasticsearch_client,
         reranker_client=reranker_client
     )
+    # 注册multimodal
+    builder.add_node('multimodal', multimodal_graph)
     # START -> Router
     builder.add_edge(START, 'router')
-    # Router -> 三个业务分支
+    # Router -> 各个业务分支
     builder.add_conditional_edges(
         'router',
         route_intent,
         {
             'knowledge': 'knowledge_search',
             'ticket': 'ticket_extract',
-            'general': 'agent'
+            'general': 'agent',
+            'multimodal': 'multimodal'
         }
     )
     # Knowledge
@@ -414,6 +425,8 @@ def create_workflow_graph(
     )
     builder.add_edge('create_ticket', END)
     builder.add_edge('cancel_ticket', END)
+    # multimodal
+    builder.add_edge('multimodal', END)
 
     return builder.compile(
         checkpointer=checkpointer

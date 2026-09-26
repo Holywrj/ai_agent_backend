@@ -5,13 +5,14 @@ from elasticsearch import AsyncElasticsearch
 from langchain_core.messages import SystemMessage, AnyMessage, HumanMessage, AIMessage
 from langchain_core.tools import BaseTool
 from langgraph.errors import NodeError
-from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import RetryPolicy, default_retry_on
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.checkpointer import checkpointer
 from app.core.llm import create_llm
+from app.graph.state import BaseWorkflowState
 from app.tools.registry import get_all_tools
 
 SYSTEM_PROMPT = (
@@ -28,7 +29,7 @@ SYSTEM_PROMPT = (
 )
 
 
-class AgentState(MessagesState):
+class AgentState(BaseWorkflowState):
     """
     LangGraph Agent 的 State。
 

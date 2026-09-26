@@ -1,37 +1,31 @@
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph import END, START, StateGraph
 
 from app.core.checkpointer import checkpointer
 from app.core.llm import create_llm
 from app.core.multimodal import create_multimodal_llm
 from app.core.storage import file_storage
 from app.exceptions.base import BusinessException
+from app.graph.state import BaseWorkflowState
 from app.schemas.multimodal import MultimodalTaskType, MultimodalTaskDecision
 
 
-class MultimodalState(MessagesState):
+class MultimodalState(BaseWorkflowState):
     """
     Multimodal Workflow 的 State。
 
-    messages: LangGraph 当前执行中的消息状态
-    user_id: 当前用户ID
-    conversation_id: 当前会话ID
-    attachments: 当前多模态请求关联的文件资源引用。每个附近包含file_id、storage_key、mime_type
     task_type: 当前多模态业务类型
     vision_result: Vision Model 产生的视觉理解结果
     structured_result: 图片结构化提取后的业务结果
-    knowledge_context: visual_knowledge 分支中的知识库检索结果
+    multimodal_knowledge_context: visual_knowledge 分支中的知识库检索结果
     answer: 当前 Multimodal Workflow 的最终业务结果
     """
-    user_id: int | None
-    conversation_id: int | None
-    attachments: list[dict[str, Any]]
     task_type: MultimodalTaskType | None
     vision_result: str | None
     structured_result: dict[str, Any] | None
-    knowledge_context: str | None
+    multimodal_knowledge_context: str | None
     answer: str | None
 
 
